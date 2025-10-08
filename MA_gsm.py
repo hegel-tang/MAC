@@ -343,7 +343,7 @@ if __name__ == "__main__":
 
                 cmd = [
                     python_exe,
-                    "src/compute_conf_worker.py",
+                    "MAC/compute_conf_worker.py",
                     conf_gpu_id,
                     filepath,
                     args.model_name,
