@@ -337,7 +337,7 @@ if __name__ == "__main__":
 
             if agent_idx > 0:
                 conf_gpu_id = "1"  
-                tmp_conf_out = f"{args.output_folder}/agent{agent_idx+1}_conf.json"
+                tmp_conf_out = f"{args.output_folder}/agent{agent_idx}_conf.json"
 
                 python_exe = shlex.quote(sys.executable) if 'shlex' in globals() else sys.executable
 

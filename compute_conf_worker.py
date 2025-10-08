@@ -19,7 +19,7 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     try:
-        from MAC.ma_confidence import compute_confidence_from_file
+        from ma_confidence import compute_confidence_from_file
     except Exception as e:
         print("Failed to import ma_confidence:", e)
         raise
