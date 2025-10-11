@@ -3,12 +3,14 @@ import os
 import tempfile
 from typing import List, Dict, Optional, Union
 
+
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 def confidence_logprob_sum(logprob_sum: torch.Tensor, attention_mask: torch.Tensor, V: int):
     """
@@ -265,6 +267,9 @@ def compute_confidence_from_file(
     Returns the same list of dicts extended with confidence information.
     """
     examples = _load_examples(filepath, output_field_name)
+    print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("  总显存:", round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2), "GB")
+    print("  已分配显存:", round(torch.cuda.memory_allocated(0) / 1024**3, 2), "GB")
     return compute_confidence_from_examples(
         examples=examples,
         model_dir=model_dir,

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import torch
 
 def main():
     if len(sys.argv) < 5:
@@ -11,8 +12,7 @@ def main():
     input_file = sys.argv[2]
     model_name = sys.argv[3]
     out_json = sys.argv[4]
-
- 
+    
     if gpu_id.strip() == "":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     else:

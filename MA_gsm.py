@@ -52,7 +52,7 @@ def parse_args():
     parser.add_argument('--no_repeat_ngram_size', default=0, type=int)
     parser.add_argument('--hf_bf16', action='store_true')
     parser.add_argument('--hf_gptq', action='store_true')
-    parser.add_argument('--gpu_memory_utilization', default=0.7, type=float)
+    parser.add_argument('--gpu_memory_utilization', default=0.9, type=float)
 
     parser.add_argument('--use_hf_conv_template', action='store_true')
     parser.add_argument('--use_imend_stop', action='store_true')
@@ -99,7 +99,8 @@ def sanitize_args(args):
 if __name__ == "__main__":
     args = parse_args()
     args = sanitize_args(args)
-
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    print("CUDA_VISIBLE_DEVICES:", visible_devices)
     # make sure output folder exists
     os.makedirs(args.output_folder, exist_ok=True)
 

@@ -108,3 +108,41 @@ Expected Output:
 }
 
 """
+
+Solver_prompt = """
+You are SOLVER. Provide a STRUCTURED solution and the FINAL ANSWER for the given problem.
+**DO NOT** output chain-of-thought or detailed internal reasoning. Only return JSON with fields:
+{
+ "role":"solver",
+ "answer":"<value or null>",
+ "structured_steps":["<key equation or intermediate result>", "..."],
+ "explanation":"<1-2 short sentences describing approach>"
+}
+Each structured step should be one line, suitable for deterministic re-computation. Max 6 steps.
+Problem: <{question}>
+"""
+
+Critic_prompt = """
+You are CRITIC. Input: the Solver's JSON output {Solver_output}.
+Check the structured_steps for logical or numeric inconsistency. List up to 3 most-likely error points (short phrases) and produce concrete checks the Verifier can perform.
+Return JSON:
+{
+ "role":"critic",
+ "issues":["<short issue 1>", "..."],
+ "suggested_checks":["<concrete check 1>", "..."]
+}
+Do NOT output chain-of-thought.
+"""
+
+Solver_revision_prompt = """
+You are SOLVER (revision). Input: the Critic's JSON output {Critic_output}.
+Based on the Critic's issues, either correct the structured_steps or explain (briefly) why the original steps are still valid.
+Return JSON in the same solver format:
+{
+ "role":"solver",
+ "answer":"<value>",
+ "structured_steps":[...],
+ "explanation":"<1-2 sentences>"
+}
+Do NOT output chain-of-thought.
+"""
