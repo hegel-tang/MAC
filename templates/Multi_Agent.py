@@ -110,33 +110,42 @@ Expected Output:
 """
 
 Solver_prompt = """
-You are SOLVER. Provide a STRUCTURED solution and the FINAL ANSWER for the given problem.
-**DO NOT** output chain-of-thought or detailed internal reasoning. Only return JSON with fields:
-{
- "role":"solver",
- "answer":"<value or null>",
- "structured_steps":["<key equation or intermediate result>", "..."],
- "explanation":"<1-2 short sentences describing approach>"
-}
-Each structured step should be one line, suitable for deterministic re-computation. Max 6 steps.
+You are SOLVER. 
+
 Problem: <{question}>
+
+Please answer this question by first reasoning and then providing your answer.
+Present your reasoning and solution in the following json format. 
+Please show your final answer in the `answer` field, e.g.,`"answer": "42"`.
+
+```json
+{
+    "reasoning": "___",
+    "answer": "___"
+}
+```
+
 """
 
 Critic_prompt = """
-You are CRITIC. Input: the Solver's JSON output {Solver_output}.
-Check the structured_steps for logical or numeric inconsistency. List up to 3 most-likely error points (short phrases) and produce concrete checks the Verifier can perform.
-Return JSON:
+You are CRITIC. Input: the origin question {question} and the Solver's JSON output {Solver_output}.
+Please check the reasoning for logical or numeric inconsistency. 
+If you find problems with Solver's reasoning, please try questioning it and updating your answer.
+If you think there is no problem, keep the original answer.
+
+```json
 {
- "role":"critic",
- "issues":["<short issue 1>", "..."],
- "suggested_checks":["<concrete check 1>", "..."]
+    "possible_doubt": "___",
+    "original_answer": "___"
+    "answer": "___"
 }
-Do NOT output chain-of-thought.
+```
+
 """
 
-Solver_revision_prompt = """
-You are SOLVER (revision). Input: the Critic's JSON output {Critic_output}.
-Based on the Critic's issues, either correct the structured_steps or explain (briefly) why the original steps are still valid.
+Reviser_prompt = """
+You are SOLVER (revision). Input: the Solver's JSON output {Solver_output} and the Critic's JSON output {Critic_output}.
+Based on the Critic's issues and the
 Return JSON in the same solver format:
 {
  "role":"solver",
