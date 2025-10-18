@@ -71,37 +71,32 @@ def compute_confidence_from_examples(
     model_dir: str,
     tokenizer: Optional[AutoTokenizer] = None,
     llm: Optional[AutoModelForCausalLM] = None,
-    batch_size: int = 4,
+    batch_size: int = 2,
     input_field_name: str = "model_input",
     output_field_name: str = "output",
-    prefix_tokens: Optional[int] = 64,
+    prefix_tokens: Optional[int] = 32,
     device: Optional[Union[str, torch.device]] = None,
     resume_from_output: Optional[str] = None,
+    vocab_chunk_size: int = 2048,
 ) -> List[Dict]:
     """
-    Compute confidence scores for `examples` using the KL(U || p) metric, only over the
-    first `prefix_tokens` of each output (after tokenization).
+    Memory-optimized and robust compute_confidence_from_examples with only an outer progress bar.
 
-    Args:
-        examples: list of dicts, each dict must contain the `input_field_name` (prompt)
-                  and `output_field_name` (list of output strings).
-        model_dir: path to model/tokenizer (HuggingFace-compatible directory/name).
-        tokenizer: optional tokenizer (if provided, will not be loaded from model_dir).
-        llm: optional model instance (if provided, will not be loaded from model_dir).
-        batch_size: base batch size for processing outputs.
-        input_field_name: field name containing the prompt string.
-        output_field_name: field name containing the list of output strings.
-        prefix_tokens: number of tokens from the start of the output to use; if None or <=0,
-                       use the entire tokenized output.
-        device: device string or torch.device; if None use 'cuda' if available else 'cpu'.
-        resume_from_output: optional path to an output file to load previously computed results;
-                            if provided, the function will skip already processed items and
-                            append new results to the returned list.
-
-    Returns:
-        A list of dicts: each input dict extended with keys `confidence_list` (list of floats)
-        and `processed_index` (int) in the same order as `examples`.
+    - Chunked vocab computation to avoid full (batch, seq_len, vocab) copies on GPU.
+    - Uses actual logits vocab dim (V_actual) instead of relying on llm.config.vocab_size.
+    - Outer tqdm progress bar only.
     """
+
+    # Safe tqdm import: fallback dummy if not installed
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        class _DummyPbar:
+            def __init__(self, *args, **kwargs): pass
+            def update(self, n=1): pass
+            def close(self): pass
+        def tqdm(*args, **kwargs):
+            return _DummyPbar()
 
     # Setup device
     if device is None:
@@ -117,11 +112,15 @@ def compute_confidence_from_examples(
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, padding=True)
 
-    # Ensure pad token exists
+    # Ensure pad token exists and sync vocab_size if resized
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "<pad>"})
         llm.config.pad_token_id = tokenizer.pad_token_id
         llm.resize_token_embeddings(len(tokenizer))
+        try:
+            llm.config.vocab_size = len(tokenizer)
+        except Exception:
+            pass
 
     tokenizer.padding_side = "right"
     llm.eval()
@@ -139,7 +138,50 @@ def compute_confidence_from_examples(
     total_items = len(examples)
     processed_items = len(to_write)
 
-    # Group thresholds (texts measured by raw length) — check large first
+    # Helper: chunked computation of sum_j log p_j from logits
+    def _logprob_sum_from_logits_chunked(logits: torch.Tensor, vocab_chunk_size: int):
+        """
+        Compute sum_j log p_j from logits in a memory-efficient chunked way.
+        Returns (logprob_sum_tensor_on_device, V_actual_int).
+        """
+        b, s, V_full = logits.shape
+
+        # Pass 1: accumulate sum_logits_total and per-position max across vocab
+        sum_logits_total = None
+        max_all = None
+        for start in range(0, V_full, vocab_chunk_size):
+            end = min(start + vocab_chunk_size, V_full)
+            chunk = logits[..., start:end]  # (b, s, chunk_len)
+            chunk_sum = chunk.sum(dim=-1).to(torch.float32)  # (b, s)
+            chunk_max = chunk.amax(dim=-1).to(torch.float32)  # (b, s)
+            if sum_logits_total is None:
+                sum_logits_total = chunk_sum
+                max_all = chunk_max
+            else:
+                sum_logits_total = sum_logits_total + chunk_sum
+                max_all = torch.maximum(max_all, chunk_max)
+            del chunk
+
+        # Pass 2: compute sum_exp over chunks using numerically-stable shift by max_all
+        sum_exp = None
+        for start in range(0, V_full, vocab_chunk_size):
+            end = min(start + vocab_chunk_size, V_full)
+            chunk = logits[..., start:end].to(torch.float32)
+            exp_chunk_sum = (chunk - max_all.unsqueeze(-1)).exp().sum(dim=-1)  # (b, s)
+            if sum_exp is None:
+                sum_exp = exp_chunk_sum
+            else:
+                sum_exp = sum_exp + exp_chunk_sum
+            del chunk, exp_chunk_sum
+
+        logsumexp = max_all + torch.log(sum_exp)  # (b, s)
+        logprob_sum = sum_logits_total - (V_full * logsumexp)  # (b, s)
+        return logprob_sum, V_full
+
+    # Outer progress bar: per-item
+    pbar_items = tqdm(total=total_items, initial=processed_items, desc="Items", unit="item")
+
+    # Iterate items
     for index in range(processed_items, total_items):
         item = examples[index]
         new_item = {k: v for k, v in item.items()}
@@ -155,7 +197,11 @@ def compute_confidence_from_examples(
         outputs = item[output_field_name]
 
         # Classify outputs by raw length (fix ordering)
-        groups = {"small": {"outputs": [], "indices": []}, "medium": {"outputs": [], "indices": []}, "large": {"outputs": [], "indices": []}}
+        groups = {
+            "small": {"outputs": [], "indices": []},
+            "medium": {"outputs": [], "indices": []},
+            "large": {"outputs": [], "indices": []},
+        }
         for idx, text in enumerate(outputs):
             if len(text) > 6 * 1024:
                 groups["large"]["outputs"].append(text)
@@ -204,25 +250,40 @@ def compute_confidence_from_examples(
                 batch_ids = full_ids[start_idx:end_idx].to(device)
                 batch_attention_mask = full_attention_mask[start_idx:end_idx].to(device)
 
-                with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
-                    logits = llm(batch_ids, attention_mask=batch_attention_mask).logits
-                    # Keep only output part
+                # forward with autocast (use bfloat16 on CUDA if available)
+                autotype = {"device_type": "cuda", "dtype": torch.bfloat16} if device.type == "cuda" else {"device_type": "cpu", "dtype": torch.float32}
+                with torch.autocast(**autotype):
+                    outputs_model = llm(batch_ids, attention_mask=batch_attention_mask, use_cache=False)
+                    logits = outputs_model.logits  # (batch, seq_len_total, V_actual)
+
+                    # keep only output part (drop prompt)
                     logits = logits[:, input_length:, :]
 
                     # Only use prefix_tokens of the output
                     if prefix_tokens is not None and prefix_tokens > 0:
                         logits = logits[:, :prefix_tokens, :]
 
-                    log_probs = F.log_softmax(logits, dim=-1)
-                    # sum over vocab to get the same intermediate quantity as the KL-based metric
-                    logprob_sum = log_probs.sum(dim=-1).to("cpu").to(torch.float32)
+                    # Compute sum_j log p_j using chunked helper
+                    logprob_sum, V_actual = _logprob_sum_from_logits_chunked(logits, vocab_chunk_size)
+
+                    # Move compact (batch, seq_len) result to CPU float32 for CPU-based metric
+                    logprob_sum_cpu = logprob_sum.to("cpu").to(torch.float32)
+
+                # free large GPU tensors asap
+                try:
+                    del outputs_model
+                except Exception:
+                    pass
+                del logits
+                torch.cuda.empty_cache()
 
                 # Align output attention mask and move to CPU for the CPU-based metric
                 batch_output_attention_mask = group_outputs_attention_mask[start_idx:end_idx]
                 if prefix_tokens is not None and prefix_tokens > 0:
                     batch_output_attention_mask = batch_output_attention_mask[:, :prefix_tokens]
 
-                batch_confidence_list = confidence_logprob_sum(logprob_sum, batch_output_attention_mask, llm.config.vocab_size)
+                # Use the actual V (V_actual) when computing the confidence metric
+                batch_confidence_list = confidence_logprob_sum(logprob_sum_cpu, batch_output_attention_mask, V_actual)
                 group_confidences.extend(batch_confidence_list)
 
             # Put back into final list
@@ -230,14 +291,13 @@ def compute_confidence_from_examples(
                 final_confidences[orig_idx] = group_confidences[i]
 
         if any(conf is None for conf in final_confidences):
-            # keep going but warn
             print(f"Warning: Some confidences were not computed for item at index {index}.")
 
         new_item["confidence_list"] = final_confidences
         new_item["processed_index"] = index
         to_write.append(new_item)
 
-        # If resume path given, write to it incrementally to allow resuming
+        # Incremental save if requested
         if resume_from_output:
             try:
                 os.makedirs(os.path.dirname(resume_from_output), exist_ok=True)
@@ -247,18 +307,29 @@ def compute_confidence_from_examples(
                 os.replace(temp_name, resume_from_output)
             except Exception as e:
                 print(f"Error writing to resume file: {e}")
-                # continue but do not crash
+
+        # update outer progress bar
+        try:
+            pbar_items.update(1)
+        except Exception:
+            pass
+
+    try:
+        pbar_items.close()
+    except Exception:
+        pass
 
     return to_write
+
 
 
 def compute_confidence_from_file(
     filepath: str,
     model_dir: str,
-    batch_size: int = 4,
+    batch_size: int = 1,
     input_field_name: str = "model_input",
     output_field_name: str = "output",
-    prefix_tokens: Optional[int] = 64,
+    prefix_tokens: Optional[int] = 32,
     resume_output_file: Optional[str] = None,
 ) -> List[Dict]:
     """

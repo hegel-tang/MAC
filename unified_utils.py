@@ -70,7 +70,7 @@ def apply_template(chat_history, model_name, args, agent_index=None):
 
     return model_inputs
 
-def load_eval_data(args, agent_index=None, data_name=None, model_name=None):
+def load_eval_data(args, agent_index=None, selected = False, data_name=None, model_name=None):
     """
     return id_strs, chat_history, model_inputs, metadata
     """
@@ -79,30 +79,7 @@ def load_eval_data(args, agent_index=None, data_name=None, model_name=None):
     if model_name is None:
         model_name = args.model_name
 
-    
-    if args.follow_up_mode != "N/A" and args.follow_up_file and os.path.exists(args.follow_up_file):
-        with open(args.follow_up_file, "r", encoding="utf-8") as f:
-            follow_up_data = json.load(f)
-        print(f"Loaded {len(follow_up_data)} examples from {args.follow_up_file}")
-        id_strs = []
-        chat_history = []
-        metadata = {}
-        for item in follow_up_data:
-            id_strs.append(item.get("session_id", "N/A"))
-            chat_history.append(item.get("chat_history", []))
-            for key in item:
-                if key in ["configs", "model_input", "generator", "output", "session_id", "chat_history"]:
-                    continue
-                metadata.setdefault(key, []).append(item[key])
-
-        # Build model_inputs using existing apply_template (compatible call)
-        try:
-            model_inputs = apply_template(chat_history, model_name, args, agent_index)
-        except TypeError:
-            model_inputs = apply_template(chat_history, model_name, args)
-        return id_strs, chat_history, model_inputs, metadata
-
-    dataset, id_name = mapping_task_names(data_name, agent_index)
+    dataset, id_name = mapping_task_names(data_name, agent_index, selected)
     print(f"Loaded {len(dataset)} examples from {data_name} (agent_index={agent_index})")
 
     expanded_id_strs = []

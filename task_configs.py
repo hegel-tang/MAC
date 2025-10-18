@@ -4,7 +4,7 @@ from _TEMPLATES import apply_ma_template
 
 
         
-def mapping_task_names(data_name,agent_index):
+def mapping_task_names(data_name,agent_index,selected):
     """
     Mapping the task names to the dataset and id name.
     """
@@ -14,10 +14,16 @@ def mapping_task_names(data_name,agent_index):
         if agent_index == 0:
             dataset = load_dataset("json", data_files={"test": "gsm8K.json"}, split="test")
         else:
-            path = f"result_dirs/gsm/agent{agent_index}_input.json" if agent_index > 1 else f"result_dirs/gsm/agent0_output.json"
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Expected previous agent outputs at {path} but not found.")
-            dataset = load_dataset("json", data_files={"test": path}, split="test")
+            if selected:
+                path = f"result_dirs/gsm/agent{agent_index}_conf_selected.json"
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"Expected previous agent outputs at {path} but not found.")
+                dataset = load_dataset("json", data_files={"test": path}, split="test")
+            else: 
+                path = f"result_dirs/gsm/agent{agent_index-1}_output.json"
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"Expected previous agent outputs at {path} but not found.")
+                dataset = load_dataset("json", data_files={"test": path}, split="test")
     
     return dataset, id_name
 

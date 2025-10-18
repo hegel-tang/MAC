@@ -296,7 +296,7 @@ class DecoderOnlyModelManager(ModelManager):
                         
                     )   
         # decoded_outputs = [self.tokenizer.decode(y).strip() for y in outputs]    
-        decoded_outputs = [self.tokenizer.decode(y[prefix_length:], skip_special_tokens=self.special_token_flags[1]) for y in outputs]    
+        decoded_outputs = [self.tokenizer.decode(y[prefix_length:], skip_special_tokens=True, clean_up_tokenization_spaces=True) for y in outputs]    
         # print(f"dectoded_outputs v1: {decoded_outputs}")
         decoded_outputs = [decoded_outputs[j:j+n] for j in range(0, len(decoded_outputs), n)]
         # print(f"dectoded_outputs v2: {decoded_outputs}")
