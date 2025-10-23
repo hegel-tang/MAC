@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument('--tokenizer_mode', type=str, default="auto")
     parser.add_argument('--data_name', default="gsm", type=str)
     parser.add_argument('--batch_size', default=4, type=int)
-    parser.add_argument('--num_outputs', default=3, type=int)
+    parser.add_argument('--num_outputs', default=1, type=int)
     parser.add_argument('--top_p',default=0.9, type=float)
     parser.add_argument('--temperature',default=0.7, type=float)
     parser.add_argument('--repetition_penalty',default=1, type=float)
@@ -356,7 +356,7 @@ if __name__ == "__main__":
         # Decide the output filepath for this agent
         if args.filepath == "auto":
             if end_index == -1 and start_index == 0:
-                filepath = f"{args.output_folder}/agent{agent_idx}_temp_output.json" if agent_idx > 0 else f"{args.output_folder}/agent0_output.json"
+                filepath = f"{args.output_folder}/agent{agent_idx}_baseline_output.json" if agent_idx > 0 else f"{args.output_folder}/agent0_baseline_output.json"
             else:
                 filepath = f"{args.output_folder}/agent{agent_idx}.{start_index}-{end_index}_output.json" if agent_idx > 0 else f"{args.output_folder}/agent0.{start_index}-{end_index}_output.json"
         else:
@@ -418,227 +418,30 @@ if __name__ == "__main__":
 
         # generation
         if args.engine == "vllm":
-            if agent_idx > 0:
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(
-                    top_p=args.top_p,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    max_tokens=64,
-                    stop=stop_words,
-                    stop_token_ids=stop_token_ids,
-                    include_stop_str_in_output=include_stop_str_in_output,
-                    n=8
-                )
+            from vllm import SamplingParams
+            sampling_params = SamplingParams(
+                top_p=args.top_p,
+                temperature=args.temperature,
+                repetition_penalty=args.repetition_penalty,
+                max_tokens=args.max_tokens,
+                stop=stop_words,
+                stop_token_ids=stop_token_ids,
+                include_stop_str_in_output=include_stop_str_in_output,
+                n=args.num_outputs
+            )
 
-                # generate in batches
-                for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating"):
-                    batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
-                    # For vllm, pass lora_request if present
-                    batch_outputs = agent_llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=agent_lora_request)
-                    # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
-                    outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
-                    # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-                # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-                conf_gpu_id = "1"  
-                tmp_conf_out = f"{args.output_folder}/agent{agent_idx}_conf.json"
-
-                python_exe = shlex.quote(sys.executable) if 'shlex' in globals() else sys.executable
-
-                cmd = [
-                    python_exe,
-                    "MAC/compute_conf_worker.py",
-                    conf_gpu_id,
-                    filepath,
-                    model_name_for_agent,
-                    tmp_conf_out,
-                ]
-
-                env = os.environ.copy()
-                if conf_gpu_id.strip() == "":
-                    env["CUDA_VISIBLE_DEVICES"] = ""
-                else:
-                    env["CUDA_VISIBLE_DEVICES"] = str(conf_gpu_id)
-
-                ret = subprocess.run(cmd, env=env)
-                if ret.returncode != 0:
-                    raise RuntimeError(f"compute_conf_worker failed (returncode={ret.returncode})")
-
-                with open(tmp_conf_out, "r", encoding="utf-8") as f:
-                    confidence_dict = json.load(f)
-                # ----- END: separate-process confidence calc -----
-
-                ind_list = []
-                group_best_val = -1.0     
-                group_best_idx = None
-
-                for i, rec in enumerate(confidence_dict):
-                    confs = rec["confidence_list"]
-                    avg = sum(confs) / len(confs) if len(confs) > 0 else 0.0
-
-                    if avg > group_best_val:
-                        group_best_val = avg
-                        group_best_idx = i
-
-                    if i % args.num_outputs == args.num_outputs - 1:
-                        ind_list.append(group_best_idx)
-                        group_best_val = -1.0
-                        group_best_idx = None
-                selected_items = []
-                for idx in ind_list:
-                    if idx is None:
-                        continue
-                    if 0 <= idx < len(confidence_dict):
-                        selected_items.append(confidence_dict[idx])
-
-                selected_output_file = f"{args.output_folder}/agent{agent_idx}_conf_selected.json"
-
-                os.makedirs(os.path.dirname(selected_output_file) or ".", exist_ok=True)
-
-                with open(selected_output_file, "w", encoding="utf-8") as f:
-                    json.dump(selected_items, f, ensure_ascii=False, indent=2)
-
-                print(f"\n=== Agent {agent_idx} starts to generate completely ===")
-                
-                id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=True, model_name=model_name_for_agent)
-                
-                model_inputs = model_inputs_orig[:]
-                
-                if len(model_inputs) != len(id_strs_orig):
-                    min_len = min(len(model_inputs), len(id_strs_orig))
-                    model_inputs = model_inputs[:min_len]
-                    id_strs = id_strs_orig[:min_len]
-                    chat_history = chat_history_orig[:min_len]
-                    metadata = {k: v[:min_len] for k, v in metadata_orig.items()}
-                else:
-                    id_strs = id_strs_orig[:]
-                    chat_history = chat_history_orig[:]
-                    metadata = {k: v[:] for k, v in metadata_orig.items()}
-                
-                # decide start_index and end_index by num_shards and shard_id (same logic as before)
-                if args.num_shards > 1:
-                    num_data = len(id_strs)
-                    shard_size = num_data // args.num_shards
-                    start_index = args.shard_id * shard_size
-                    end_index = (args.shard_id + 1) * shard_size
-                    if args.shard_id == args.num_shards - 1:
-                        end_index = num_data
-                else:
-                    start_index = args.start_index
-                    end_index = args.end_index
-
-                # Decide the output filepath for this agent
-                if args.filepath == "auto":
-                    # file per agent
-                    if end_index == -1 and start_index == 0:
-                        filepath = f"{args.output_folder}/agent{agent_idx}_output.json"
-                    else:
-                        filepath = f"{args.output_folder}/agent{agent_idx}.{start_index}-{end_index}_output.json"
-
-                else:
-                    # if explicit filepath given, append agent suffix to avoid overwrite
-                    base, ext = os.path.splitext(args.filepath)
-                    filepath = f"{base}.agent{agent_idx}{ext}"
-
-                    output_folder = "/".join(filepath.split("/")[:-1])
-                    if not os.path.exists(output_folder):
-                        os.makedirs(output_folder, exist_ok=True)
-
-                # Clip indices and slice inputs
-                if end_index < 0 or end_index > len(model_inputs):
-                    end_index = len(model_inputs)
-                model_inputs = model_inputs[start_index:end_index]
-                id_strs = id_strs[start_index:end_index]
-                chat_history = chat_history[start_index:end_index]
-                metadata = {key: metadata[key][start_index:end_index] for key in metadata}
-
-                print(f"Agent {agent_idx} will run on indices [{start_index}:{end_index}] -> {len(model_inputs)} items")
-                print(f"Agent {agent_idx} output filepath: {filepath}")
-
-                # Load existing outputs for this agent if present and not overwrite
-                outputs = []
-                if os.path.exists(filepath) and not args.overwrite:
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        formatted_outputs = json.load(f)
-                    for output_item in formatted_outputs:
-                        outputs.append([output_item["output"]] if type(output_item["output"]) == str else output_item["output"])
-                    num_skipped = len(outputs)
-                    print(f"Agent {agent_idx}: found existing file, skipped first {num_skipped} examples")
-                else:
-                    num_skipped = 0
-
-                # Load cache file if provided (same as before)
-                cache_outputs = {}
-                if args.cache_filepath is not None:
-                    if os.path.exists(args.cache_filepath):
-                        with open(args.cache_filepath, "r", encoding="utf-8") as f:
-                            cache_data = json.load(f)
-                        for output_item in cache_data:
-                            if type(output_item.get("output")) == list and len(output_item["output"]) > 0 and len(output_item["output"][0]) > 0:
-                                cache_outputs[output_item["session_id"]] = output_item
-                    print(f"Agent {agent_idx}: Loaded {len(cache_outputs)} non-empty outputs from cache: {args.cache_filepath}")
-
-                # Prepare generation loop for this agent
-                todo_inputs = model_inputs[num_skipped:]
-                if len(todo_inputs) == 0:
-                    print(f"Agent {agent_idx}: no new inputs to process.")
-                    # still append the existing outputs (maybe empty) to outputs_per_agent
-                    outputs_per_agent.append(outputs)
-                    continue
-
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(
-                    top_p=args.top_p,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    max_tokens=args.max_tokens,
-                    stop=stop_words,
-                    stop_token_ids=stop_token_ids,
-                    include_stop_str_in_output=include_stop_str_in_output,
-                    n=args.num_outputs
-                )
-
-                # generate in batches
-                for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating"):
-                    batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
-                    # For vllm, pass lora_request if present
-                    batch_outputs = agent_llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=agent_lora_request)
-                    # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
-                    outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
-                    # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-                # final save
+            # generate in batches
+            for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating"):
+                batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
+                # For vllm, pass lora_request if present
+                batch_outputs = agent_llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=agent_lora_request)
+                # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
+                outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
+                # save incremental results for safety
                 save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
 
-            else:
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(
-                    top_p=args.top_p,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    max_tokens=args.max_tokens,
-                    stop=stop_words,
-                    stop_token_ids=stop_token_ids,
-                    include_stop_str_in_output=include_stop_str_in_output,
-                    n=args.num_outputs
-                )
-
-                # generate in batches
-                for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating"):
-                    batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
-                    # For vllm, pass lora_request if present
-                    batch_outputs = agent_llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=agent_lora_request)
-                    # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
-                    outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
-                    # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-                # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
+            # final save
+            save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
             
 
         elif args.engine == "hf":
