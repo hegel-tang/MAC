@@ -14,6 +14,7 @@ from tenacity import (
     stop_after_attempt,
     wait_random_exponential,
 )  # for exponential backoff
+import re
 
 
 class EndOfFunctionCriteria(StoppingCriteria):
@@ -242,12 +243,9 @@ class DecoderOnlyModelManager(ModelManager):
             args_.__setattr__("eof_strings", args.get("eof_strings", ""))
             args = args_
             
-        if args.eof_strings and "|" in args.eof_strings:
-            eof_strings = [s.strip() for s in args.eof_strings.split("|")]
-            stopping_criteria = StoppingCriteriaList([EndOfFunctionCriteria(start_length=prefix_length, eof_strings=eof_strings, tokenizer=self.tokenizer)])
-        else:
-            eof_strings = None 
-            stopping_criteria = None 
+        # Defer creation of stopping criteria until after tokenization so we know prefix_length.
+        eof_strings = None
+        stopping_criteria = None
 
         # Run Llama model inference to generate output
         if len(input_data) > 1:        
@@ -259,20 +257,22 @@ class DecoderOnlyModelManager(ModelManager):
         n = 1 if args.num_outputs < 0 else args.num_outputs
         if args.num_outputs < 0:
             input_data = [in_text for _ in range(n) for in_text in input_data]
-    
+
         inputs = self.tokenizer(input_data, return_tensors="pt", add_special_tokens=self.special_token_flags[0], padding=padding)
-        _, prefix_length = inputs["input_ids"].shape 
-         
+        _, prefix_length = inputs["input_ids"].shape
+
         # print(f"prefix_length: {prefix_length}")
-        
-        
-        
-         
-        low_memory = False 
+
+        low_memory = False
         if args.penalty_alpha > 0:
             # low_memory = True  # if the memory is not enough for you
-            pass 
+            pass
         # print(f"args.max_output_tokens={args.max_output_tokens}")
+        # If EOF-based stopping strings were provided, build the stopping criteria now that prefix_length is known
+        if args.eof_strings and "|" in args.eof_strings:
+            eof_strings = [s.strip() for s in args.eof_strings.split("|")]
+            stopping_criteria = StoppingCriteriaList([EndOfFunctionCriteria(start_length=prefix_length, eof_strings=eof_strings, tokenizer=self.tokenizer)])
+
         outputs = self.model.generate(
                         input_ids=inputs['input_ids'].to(device), 
                         attention_mask=inputs['attention_mask'].to(device),
@@ -296,7 +296,7 @@ class DecoderOnlyModelManager(ModelManager):
                         
                     )   
         # decoded_outputs = [self.tokenizer.decode(y).strip() for y in outputs]    
-        decoded_outputs = [self.tokenizer.decode(y[prefix_length:], skip_special_tokens=True, clean_up_tokenization_spaces=True) for y in outputs]    
+        decoded_outputs = [self.tokenizer.decode(y[prefix_length:], skip_special_tokens=True, clean_up_tokenization_spaces=True) for y in outputs]
         # print(f"dectoded_outputs v1: {decoded_outputs}")
         decoded_outputs = [decoded_outputs[j:j+n] for j in range(0, len(decoded_outputs), n)]
         # print(f"dectoded_outputs v2: {decoded_outputs}")
@@ -311,6 +311,21 @@ class DecoderOnlyModelManager(ModelManager):
                     stripped_outputs.append(o)
                 cleaned_decoded_outputs.append(stripped_outputs)
             decoded_outputs = cleaned_decoded_outputs
+
+        # Post-process decoded outputs to remove tokenizer placeholder tokens like [unused1], [unused2], etc.
+        post_cleaned = []
+        for outs in decoded_outputs:
+            single_cleaned = []
+            for o in outs:
+                # remove common HF tokenizer placeholders like [unused1], [unused2]
+                o = re.sub(r"\[unused\d+\]", "", o)
+                o = o.replace("<|endoftext|>", " ")
+                o = o.replace("<pad>", " ")
+                o = o.replace("<end_of_turn>", " ")
+                o = o.strip()
+                single_cleaned.append(o)
+            post_cleaned.append(single_cleaned)
+        decoded_outputs = post_cleaned
 
         if self.adapt_mode in ["prefix", "retrieve+prefix"]:
             decoded_outputs_with_prefixes = []

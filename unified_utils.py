@@ -90,7 +90,23 @@ def load_eval_data(args, agent_index=None, selected = False, data_name=None, mod
         orig_session_id = item.get(id_name, f"{data_name}#{ind}")
 
         # detect upstream outputs: when agent_index > 0, items produced by previous agent should have "output"
-        if agent_index is not None and agent_index > 0 and "output" in item:
+        if selected:
+            outs = item["model_input"]
+            
+            sid = f"{orig_session_id}"
+
+
+            expanded_id_strs.append(sid)
+            expanded_chat_history.append([outs])
+
+            # metadata: for each key in original item, append corresponding value (duplicate for each expansion)
+            for key in item:
+                # set output metadata to the single string out_j
+                if key == "output":
+                    expanded_metadata.setdefault(key, []).append(outs)
+                else:
+                    expanded_metadata.setdefault(key, []).append(item.get(key))
+        elif agent_index is not None and agent_index > 0 and "output" in item:
             outs = item["output"]
             
             # unify type: if string, treat as single-element list
@@ -125,6 +141,7 @@ def load_eval_data(args, agent_index=None, selected = False, data_name=None, mod
                         expanded_metadata.setdefault(key, []).append(out_j)
                     else:
                         expanded_metadata.setdefault(key, []).append(item.get(key))
+                # defer creating model_inputs until after we've finished expanding all samples
                 
         else:
             # agent_index == 0 or no "output" field: treat as normal (single sample)
@@ -139,14 +156,16 @@ def load_eval_data(args, agent_index=None, selected = False, data_name=None, mod
             expanded_chat_history.append([prompt])
             for key in item:
                 expanded_metadata.setdefault(key, []).append(item.get(key))
+            # defer creating model_inputs until after we've finished expanding all samples
 
     # Now expanded_chat_history contains one prompt per (expanded) sample.
-    # Apply template to create model_inputs (keep backwards-compatible call)
-    try:
+    # For selected=True we already have model inputs (they are provided in the dataset),
+    # so do NOT apply the HF template again. Otherwise, apply the template once.
+    if selected:
+        # expanded_chat_history is a list of single-element lists; extract the inner string
+        model_inputs = [ch[0] if isinstance(ch, list) and len(ch) > 0 else "" for ch in expanded_chat_history]
+    else:
         model_inputs = apply_template(expanded_chat_history, model_name, args, agent_index)
-    except TypeError:
-        model_inputs = apply_template(expanded_chat_history, model_name, args)
-
 
     return expanded_id_strs, expanded_chat_history, model_inputs, expanded_metadata
 
@@ -167,7 +186,7 @@ def clear_output(output, model_name):
 
 
 def save_outputs(
-    args, id_strs, outputs, chat_history, metadata, model_inputs, filepath
+    args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=None
 ):
     formatted_outputs = []
     for ind in range(len(outputs)):
@@ -175,8 +194,9 @@ def save_outputs(
         output_item["session_id"] = id_strs[ind]
         output_item["chat_history"] = chat_history[ind]
         output_item["model_input"] = model_inputs[ind]
-        output_item["output"] = [clear_output(o, args.model_name) for o in outputs[ind]]
-        output_item["generator"] = args.model_name
+        gen_name = model_name if model_name is not None else args.model_name
+        output_item["output"] = [clear_output(o, gen_name) for o in outputs[ind]]
+        output_item["generator"] = gen_name
         output_item["configs"] = {
             "engine": args.engine,
             "repetition_penalty": args.repetition_penalty,

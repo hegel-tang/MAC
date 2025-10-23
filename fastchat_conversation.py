@@ -36,9 +36,13 @@ def map_to_conv(model_name):
     elif "starling-lm" in model_name.lower():
         conv = get_conv_template("openchat_3.5")
     else:
-        raise ValueError(f"Model {model_name} is not supported.")
+        # Unknown model: do not raise here to allow using a safe default template.
+        # This avoids crashes when a model (for example, a local or newer model)
+        # isn't explicitly listed in HF_TEMPLATED_MODELS or recognized by name.
+        #print(f"Warning: Model {model_name} is not recognized; falling back to 'raw' template.")
+        conv = get_conv_template("raw")
 
-    return conv 
+    return conv
 
 class HF_Conversation:
     def __init__(self, model_name):

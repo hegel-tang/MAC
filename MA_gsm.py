@@ -1,5 +1,7 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Avoid tokenizers parallelism warning when processes are forked
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import requests
 from typing import List
 import argparse
@@ -14,6 +16,8 @@ from hf_models import DecoderOnlyModelManager
 from transformers import AutoTokenizer
 import subprocess
 import shlex
+import gc
+import time
 #from ma_confidence import compute_confidence_from_file
 # import multiprocessing as mp
 # mp.set_start_method('spawn', force=True)
@@ -36,7 +40,7 @@ def parse_args():
     parser.add_argument('--temperature',default=0.7, type=float)
     parser.add_argument('--repetition_penalty',default=1, type=float)
     parser.add_argument('--max_tokens',default=1000, type=int)
-    parser.add_argument('--max_model_len',default=-1, type=int)
+    parser.add_argument('--max_model_len',default=4096, type=int)
     parser.add_argument('--num_shards', default=1, type=int)
     parser.add_argument('--shard_id', default=0, type=int)
     parser.add_argument('--start_index',default=0, type=int) # 0 means from the beginning of the list
@@ -52,7 +56,7 @@ def parse_args():
     parser.add_argument('--no_repeat_ngram_size', default=0, type=int)
     parser.add_argument('--hf_bf16', action='store_true')
     parser.add_argument('--hf_gptq', action='store_true')
-    parser.add_argument('--gpu_memory_utilization', default=0.9, type=float)
+    parser.add_argument('--gpu_memory_utilization', default=0.6, type=float)
 
     parser.add_argument('--use_hf_conv_template', action='store_true')
     parser.add_argument('--use_imend_stop', action='store_true')
@@ -61,7 +65,12 @@ def parse_args():
     # parser.add_argument('--cot', type=str, default="True")
     parser.add_argument('--run_name', type=str, default="")
 
-    parser.add_argument('--agent_num',default=3,type=int)
+    parser.add_argument('--agent_num',default=2,type=int)
+    # Comma-separated list of model names/paths for each agent (length will be truncated/padded to agent_num)
+    parser.add_argument('--agent_model_names', default="gemma-3-4b,SmolLM3-3B", type=str,
+                        help='Comma-separated model names/paths for agents. If empty, uses --model_name for all agents')
+    # If set, unload vllm model from memory after an agent finishes generating
+    parser.add_argument('--unload_after_agent', action='store_true', help='Unload vllm model after each agent finishes to save GPU memory')
     return parser.parse_args()
 
 def infer_maybe_lora(model_name):
@@ -113,41 +122,150 @@ if __name__ == "__main__":
     llm_list = []
     lora_requests = []
 
-    if args.tokenizer_name == "auto":
-        args.tokenizer_name = args.model_name
+    # Keep args.tokenizer_name as 'auto' to allow per-agent tokenizer selection.
 
     if args.engine == "vllm":
-        # only create one vllm instance and one LoRA request (if applicable), then reuse
+        # Per-agent lazy loading: do not create all LLMs at startup to save memory.
         from vllm import LLM
         max_model_len = None if args.max_model_len == -1 else args.max_model_len
 
-        base_model_name_or_path, lora_model_name_or_path = infer_maybe_lora(args.model_name)
-
-        if lora_model_name_or_path:
-            from vllm.lora.request import LoRARequest
-            shared_lora_request = LoRARequest(lora_model_name_or_path.split("/")[-1], 1, lora_model_name_or_path)
+        # build agent model name list
+        if args.agent_model_names:
+            candidate_names = [x.strip() for x in args.agent_model_names.split(",") if x.strip()]
         else:
-            shared_lora_request = None
-
-        # create single shared LLM instance
-        shared_llm = LLM(
-            model=base_model_name_or_path,
-            tokenizer=args.tokenizer_name,
-            tensor_parallel_size=args.tensor_parallel_size,
-            download_dir=args.download_dir,
-            dtype=args.dtype,
-            tokenizer_mode=args.tokenizer_mode,
-            max_model_len=max_model_len,
-            trust_remote_code=True,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            enable_lora=(shared_lora_request is not None),
-            max_num_seqs=128
-        )
-
-        # reuse the same instance/reference for each agent
+            candidate_names = []
+        # pad/truncate to agent_num
+        agent_model_names = []
         for i in range(args.agent_num):
-            llm_list.append(shared_llm)
-            lora_requests.append(shared_lora_request)
+            if i < len(candidate_names):
+                agent_model_names.append(candidate_names[i])
+            else:
+                agent_model_names.append(args.model_name)
+
+        # We store None in llm_list initially; will load per-agent LLM when agent runs
+        for i in range(args.agent_num):
+            llm_list.append(None)
+            lora_requests.append(None)
+
+        # attach helper for lazy loading
+        def load_agent_llm(agent_idx):
+            model_name_for_agent = agent_model_names[agent_idx]
+            base_model_name_or_path, lora_model_name_or_path = infer_maybe_lora(model_name_for_agent)
+            lora_req = None
+            if lora_model_name_or_path:
+                from vllm.lora.request import LoRARequest
+                lora_req = LoRARequest(lora_model_name_or_path.split("/")[-1], 1, lora_model_name_or_path)
+            # try to instantiate LLM, with simple backoff reducing gpu_memory_utilization
+            trial_util = args.gpu_memory_utilization
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    llm_instance = LLM(
+                        model=base_model_name_or_path,
+                        tokenizer=model_name_for_agent if args.tokenizer_name == "auto" else args.tokenizer_name,
+                        tensor_parallel_size=args.tensor_parallel_size,
+                        download_dir=args.download_dir,
+                        dtype=args.dtype,
+                        tokenizer_mode=args.tokenizer_mode,
+                        max_model_len=max_model_len,
+                        trust_remote_code=True,
+                        gpu_memory_utilization=trial_util,
+                        enable_lora=(lora_req is not None),
+                        max_num_seqs=128,
+                        enable_sleep_mode=True
+                    )
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    # if memory related, try to reduce requested utilization
+                    msg = str(e)
+                    if "Free memory on device" in msg or "less than desired GPU memory utilization" in msg:
+                        trial_util = max(0.2, trial_util - 0.2)
+                        continue
+                    else:
+                        break
+            if last_exc is not None:
+                raise last_exc
+            llm_list[agent_idx] = llm_instance
+            lora_requests[agent_idx] = lora_req
+            return llm_instance, lora_req
+
+        # Helper to unload an agent's llm
+        def unload_agent_llm(agent_idx):
+            inst = llm_list[agent_idx]
+            if inst is None:
+                print(f"unload_agent_llm: no instance for agent {agent_idx}, nothing to unload")
+                return
+
+            print(f"unload_agent_llm: unloading agent {agent_idx} LLM instance...")
+            try:
+                inst.sleep(level=2)
+                print(f"unload_agent_llm: called close() on agent {agent_idx} LLM")
+            except Exception as e:
+                print(f"unload_agent_llm: exception calling close() on agent {agent_idx}: {e}")
+
+            # remove references
+            llm_list[agent_idx] = None
+            lora_requests[agent_idx] = None
+
+            # best-effort GPU memory cleanup
+            try:
+                import torch
+                torch.cuda.empty_cache()
+                print("unload_agent_llm: torch.cuda.empty_cache() called")
+            except Exception:
+                print("unload_agent_llm: torch not available or cuda empty cache failed")
+            gc.collect()
+
+            # Wait for GPU memory to be freed (best-effort).
+            def _get_gpu_mem_info(gpu_index=0):
+                try:
+                    out = subprocess.check_output([
+                        "nvidia-smi",
+                        "--query-gpu=memory.total,memory.free",
+                        "--format=csv,noheader,nounits",
+                        "-i",
+                        str(gpu_index),
+                    ])
+                    line = out.decode().strip().splitlines()[0]
+                    total_kb, free_kb = [int(x) for x in line.split(",")]
+                    total_gb = total_kb / 1024.0
+                    free_gb = free_kb / 1024.0
+                    return total_gb, free_gb
+                except Exception as e:
+                    print(f"unload_agent_llm: failed to query nvidia-smi: {e}")
+                    return None, None
+
+            def _wait_for_gpu_free(required_free_gb, timeout=60, poll_interval=2, gpu_index=0):
+                start = time.time()
+                while time.time() - start < timeout:
+                    total, free = _get_gpu_mem_info(gpu_index)
+                    if free is None:
+                        # cannot query, fallback to fixed sleep
+                        print("unload_agent_llm: cannot query GPU free memory, falling back to sleep(20)")
+                        time.sleep(20)
+                        return True
+                    print(f"unload_agent_llm: waiting for free GPU >= {required_free_gb:.2f}GB; current free={free:.2f}GB")
+                    if free >= required_free_gb:
+                        return True
+                    time.sleep(poll_interval)
+                return False
+
+            total_gb, free_gb = _get_gpu_mem_info(0)
+            if total_gb is not None:
+                requested_util = float(getattr(args, "gpu_memory_utilization", 0.5))
+                required_free = max(1.0, total_gb * requested_util)
+                ok = _wait_for_gpu_free(required_free, timeout=60, poll_interval=2, gpu_index=0)
+                if not ok:
+                    print("unload_agent_llm: GPU did not free up in time, sleeping fallback 20s")
+                    time.sleep(20)
+                else:
+                    print("unload_agent_llm: GPU memory freed to required level")
+            else:
+                # couldn't query via nvidia-smi: fallback to fixed sleep
+                print("unload_agent_llm: nvidia-smi unavailable, sleeping fallback 20s")
+                time.sleep(20)
 
     elif args.engine == "hf":
         llm = DecoderOnlyModelManager(args.model_name, args.model_name, cache_dir=args.download_dir,
@@ -160,19 +278,7 @@ if __name__ == "__main__":
         raise ValueError(f"Unsupported engine: {args.engine}")
     print(f"Loaded {len(llm_list)} agent models.")    
 
-    # token/stopping token logic (done once; assumes model_name same for all agents)
-    stop_words = []
-    include_stop_str_in_output = False
-    stop_token_ids = []
-    if args.model_name in IM_END_MODELS:
-        hf_tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-        potential_end_tokens = ["<|im_end|>" , "<|eot_id|>"]
-        for potential_end_token in potential_end_tokens:
-            if potential_end_token in hf_tokenizer.get_vocab():
-                stop_token_ids += [hf_tokenizer.get_vocab()[potential_end_token]]
-    if args.model_name in HF_TEMPLATED_MODELS:
-        hf_tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-        stop_token_ids.append(hf_tokenizer.eos_token_id)
+    # (Per-agent stop/token logic moved into agent loop so templates and stops match each agent's model.)
 
     # We'll store each agent's outputs here: a list where each element is the outputs list-of-lists for that agent
     outputs_per_agent = []
@@ -180,9 +286,41 @@ if __name__ == "__main__":
     # For each agent, perform generation. Agent 0 uses original dataset; agent k>0 uses outputs_per_agent[k-1]
     for agent_idx in range(len(llm_list)):
         print(f"\n=== Running agent {agent_idx} ===")
-        agent_llm = llm_list[agent_idx]
-        agent_lora_request = lora_requests[agent_idx]
-        id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args,agent_idx)
+        # Lazy-load per-agent LLM if using vllm
+        if args.engine == "vllm":
+            if llm_list[agent_idx] is None:
+                agent_llm, agent_lora_request = load_agent_llm(agent_idx)
+            else:
+                agent_llm = llm_list[agent_idx]
+                agent_lora_request = lora_requests[agent_idx]
+        else:
+            agent_llm = llm_list[agent_idx]
+            agent_lora_request = lora_requests[agent_idx]
+        # determine which model name this agent uses
+        if args.engine == "vllm":
+            model_name_for_agent = agent_model_names[agent_idx]
+        else:
+            model_name_for_agent = args.model_name
+
+        # pass per-agent model_name into load_eval_data so templates (map_to_conv) use correct model
+        id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=False, model_name=model_name_for_agent)
+
+        # token/stopping token logic per-agent
+        stop_words = []
+        include_stop_str_in_output = False
+        stop_token_ids = []
+        try:
+            if model_name_for_agent in IM_END_MODELS:
+                hf_tokenizer = AutoTokenizer.from_pretrained(model_name_for_agent, trust_remote_code=True)
+                potential_end_tokens = ["<|im_end|>", "<|eot_id|>"]
+                for potential_end_token in potential_end_tokens:
+                    if potential_end_token in hf_tokenizer.get_vocab():
+                        stop_token_ids += [hf_tokenizer.get_vocab()[potential_end_token]]
+            if model_name_for_agent in HF_TEMPLATED_MODELS:
+                hf_tokenizer = AutoTokenizer.from_pretrained(model_name_for_agent, trust_remote_code=True)
+                stop_token_ids.append(hf_tokenizer.eos_token_id)
+        except Exception:
+            stop_token_ids = []
         
         if agent_idx == 0:
             id_strs = id_strs_orig[:]  # session ids
@@ -270,6 +408,12 @@ if __name__ == "__main__":
             print(f"Agent {agent_idx}: no new inputs to process.")
             # still append the existing outputs (maybe empty) to outputs_per_agent
             outputs_per_agent.append(outputs)
+            try:
+                print(f"Agent {agent_idx}: unloading agent LLM to free GPU memory (unload_after_agent=True)")
+                unload_agent_llm(agent_idx)
+            except Exception as e:
+                print(f"Agent {agent_idx}: unload_agent_llm raised exception: {e}")
+            
             continue
 
         # generation
@@ -295,10 +439,10 @@ if __name__ == "__main__":
                     # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
                     outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
                     # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath)
+                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
 
                 # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath)
+                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
                 conf_gpu_id = "1"  
                 tmp_conf_out = f"{args.output_folder}/agent{agent_idx}_conf.json"
 
@@ -309,7 +453,7 @@ if __name__ == "__main__":
                     "MAC/compute_conf_worker.py",
                     conf_gpu_id,
                     filepath,
-                    args.model_name,
+                    model_name_for_agent,
                     tmp_conf_out,
                 ]
 
@@ -358,8 +502,8 @@ if __name__ == "__main__":
                     json.dump(selected_items, f, ensure_ascii=False, indent=2)
 
                 print(f"\n=== Agent {agent_idx} starts to generate completely ===")
-                selected = True
-                id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args,agent_idx,selected)
+                
+                id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=True, model_name=model_name_for_agent)
                 
                 model_inputs = model_inputs_orig[:]
                 
@@ -465,10 +609,10 @@ if __name__ == "__main__":
                     # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
                     outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
                     # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs,filepath)
+                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
 
                 # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath)
+                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
 
             else:
                 from vllm import SamplingParams
@@ -491,10 +635,10 @@ if __name__ == "__main__":
                     # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
                     outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
                     # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath)
+                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
 
                 # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath)
+                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
             
 
         elif args.engine == "hf":
@@ -512,14 +656,25 @@ if __name__ == "__main__":
                 batch_outputs = agent_llm.infer_generate(batch_inputs, args=gen_args)
                 outputs.extend(batch_outputs)
                 
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath)
+                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
 
-            save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath)
+            save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
 
         else:
             raise ValueError(f"Unsupported engine: {args.engine}")
 
 
         print(f"Agent {agent_idx} finished. Generated {len(outputs)} items.")
+
+        # Optionally unload vllm model instance for this agent to free GPU memory
+        if args.engine == "vllm":
+            if getattr(args, "unload_after_agent", False):
+                try:
+                    print(f"Agent {agent_idx}: unloading agent LLM to free GPU memory (unload_after_agent=True)")
+                    unload_agent_llm(agent_idx)
+                except Exception as e:
+                    print(f"Agent {agent_idx}: unload_agent_llm raised exception: {e}")
+            else:
+                print(f"Agent {agent_idx}: unload_after_agent not set; keeping LLM instance in memory")
 
     print("\nAll agents finished. Outputs saved per agent in:", args.output_folder)
