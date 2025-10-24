@@ -7,6 +7,9 @@ from typing import List, Dict, Optional, Union
 import pandas as pd
 import numpy as np
 import torch
+print(torch.version.cuda)   # 查看 PyTorch 编译的 CUDA 版本
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0))
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 

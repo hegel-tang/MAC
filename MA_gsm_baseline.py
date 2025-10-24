@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument('--no_repeat_ngram_size', default=0, type=int)
     parser.add_argument('--hf_bf16', action='store_true')
     parser.add_argument('--hf_gptq', action='store_true')
-    parser.add_argument('--gpu_memory_utilization', default=0.6, type=float)
+    parser.add_argument('--gpu_memory_utilization', default=0.8, type=float)
 
     parser.add_argument('--use_hf_conv_template', action='store_true')
     parser.add_argument('--use_imend_stop', action='store_true')
@@ -303,7 +303,7 @@ if __name__ == "__main__":
             model_name_for_agent = args.model_name
 
         # pass per-agent model_name into load_eval_data so templates (map_to_conv) use correct model
-        id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=False, model_name=model_name_for_agent)
+        id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=False, model_name=model_name_for_agent,baseline=True)
 
         # token/stopping token logic per-agent
         stop_words = []

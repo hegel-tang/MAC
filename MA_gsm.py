@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument('--no_repeat_ngram_size', default=0, type=int)
     parser.add_argument('--hf_bf16', action='store_true')
     parser.add_argument('--hf_gptq', action='store_true')
-    parser.add_argument('--gpu_memory_utilization', default=0.6, type=float)
+    parser.add_argument('--gpu_memory_utilization', default=0.8, type=float)
 
     parser.add_argument('--use_hf_conv_template', action='store_true')
     parser.add_argument('--use_imend_stop', action='store_true')

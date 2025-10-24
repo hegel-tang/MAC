@@ -131,7 +131,7 @@ Critic_prompt = """
 You are CRITIC. Input: the origin question {question} and the Solver's JSON output {Solver_output}.
 Please check the reasoning for logical or numeric inconsistency. 
 If you find problems with Solver's reasoning, please try questioning it and updating your answer.
-If you think there is no problem, keep the original answer.
+If you think there is no problem, keep the Solver's original answer.
 
 ```json
 {

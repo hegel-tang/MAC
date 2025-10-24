@@ -70,7 +70,7 @@ def apply_template(chat_history, model_name, args, agent_index=None):
 
     return model_inputs
 
-def load_eval_data(args, agent_index=None, selected = False, data_name=None, model_name=None):
+def load_eval_data(args, agent_index=None, selected = False, data_name=None, model_name=None, baseline=False):
     """
     return id_strs, chat_history, model_inputs, metadata
     """
@@ -79,7 +79,7 @@ def load_eval_data(args, agent_index=None, selected = False, data_name=None, mod
     if model_name is None:
         model_name = args.model_name
 
-    dataset, id_name = mapping_task_names(data_name, agent_index, selected)
+    dataset, id_name = mapping_task_names(data_name, agent_index, selected,baseline)
     print(f"Loaded {len(dataset)} examples from {data_name} (agent_index={agent_index})")
 
     expanded_id_strs = []
