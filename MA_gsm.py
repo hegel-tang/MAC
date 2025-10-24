@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument('--data_name', default="gsm", type=str)
     parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--num_outputs', default=3, type=int)
+    parser.add_argument('--sample_num', default=8, type=int)
     parser.add_argument('--top_p',default=0.9, type=float)
     parser.add_argument('--temperature',default=0.7, type=float)
     parser.add_argument('--repetition_penalty',default=1, type=float)
@@ -428,7 +429,7 @@ if __name__ == "__main__":
                     stop=stop_words,
                     stop_token_ids=stop_token_ids,
                     include_stop_str_in_output=include_stop_str_in_output,
-                    n=8
+                    n=args.sample_num
                 )
 
                 # generate in batches
@@ -677,3 +678,60 @@ if __name__ == "__main__":
             
 
     print("\nAll agents finished. Outputs saved per agent in:", args.output_folder)
+    conf_gpu_id = "1"  
+    tmp_conf_out = f"{args.output_folder}/final_conf.json"
+
+    python_exe = shlex.quote(sys.executable) if 'shlex' in globals() else sys.executable
+
+    cmd = [
+        python_exe,
+        "MAC/compute_conf_worker.py",
+        conf_gpu_id,
+        f"{args.output_folder}/agent{args.agent_num-1}_output.json",
+        model_name_for_agent,
+        tmp_conf_out,
+    ]
+
+    env = os.environ.copy()
+    if conf_gpu_id.strip() == "":
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = str(conf_gpu_id)
+
+    ret = subprocess.run(cmd, env=env)
+    if ret.returncode != 0:
+        raise RuntimeError(f"compute_conf_worker failed (returncode={ret.returncode})")
+
+    with open(tmp_conf_out, "r", encoding="utf-8") as f:
+        confidence_dict = json.load(f)
+    # ----- END: separate-process confidence calc -----
+
+    # For each record in confidence_dict, keep only the output whose confidence equals the max
+    selected_items = []
+    for rec in confidence_dict:
+        # expected rec to contain at least 'confidence_list' and 'output'
+        confs = rec.get("confidence_list") 
+        outs = rec.get("output")
+
+            # pick index of max confidence (first occurrence if multiple)
+        max_idx = int(max(range(len(confs)), key=lambda j: confs[j]))
+        sel_out = outs[max_idx]
+        sel_conf = confs[max_idx]
+        # preserve session id if present
+        sess = rec.get("session_id") 
+        input = rec.get("model_input") 
+        question = rec.get("question") 
+        answer = rec.get("answer") 
+        generator = rec.get("generator")
+        dataset = rec.get("dataset")
+        selected_items.append({"session_id": sess, "model_inputs":input,"output": [sel_out], "generator":generator,"dataset":dataset,"question":question,"answer":answer,"confidence": [sel_conf]})
+    print(1)
+    # write final answers
+    selected_output_file = f"{args.output_folder}/MA_final_answer.json"
+    os.makedirs(os.path.dirname(selected_output_file) or ".", exist_ok=True)
+    with open(selected_output_file, "w", encoding="utf-8") as f:
+        json.dump(selected_items, f, ensure_ascii=False, indent=2)
+    
+
+
+

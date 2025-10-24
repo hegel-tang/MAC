@@ -77,7 +77,7 @@ def compute_confidence_from_examples(
     batch_size: int = 2,
     input_field_name: str = "model_input",
     output_field_name: str = "output",
-    prefix_tokens: Optional[int] = 32,
+    prefix_tokens: Optional[int] = None,
     device: Optional[Union[str, torch.device]] = None,
     resume_from_output: Optional[str] = None,
     vocab_chunk_size: int = 2048,
@@ -332,7 +332,7 @@ def compute_confidence_from_file(
     batch_size: int = 1,
     input_field_name: str = "model_input",
     output_field_name: str = "output",
-    prefix_tokens: Optional[int] = 32,
+    prefix_tokens: Optional[int] = None,
     resume_output_file: Optional[str] = None,
 ) -> List[Dict]:
     """
