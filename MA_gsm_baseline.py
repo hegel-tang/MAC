@@ -39,8 +39,8 @@ def parse_args():
     parser.add_argument('--top_p',default=0.9, type=float)
     parser.add_argument('--temperature',default=0.7, type=float)
     parser.add_argument('--repetition_penalty',default=1, type=float)
-    parser.add_argument('--max_tokens',default=1000, type=int)
-    parser.add_argument('--max_model_len',default=4096, type=int)
+    parser.add_argument('--max_tokens',default=4096, type=int)
+    parser.add_argument('--max_model_len',default=-1, type=int)
     parser.add_argument('--num_shards', default=1, type=int)
     parser.add_argument('--shard_id', default=0, type=int)
     parser.add_argument('--start_index',default=0, type=int) # 0 means from the beginning of the list
@@ -65,9 +65,9 @@ def parse_args():
     # parser.add_argument('--cot', type=str, default="True")
     parser.add_argument('--run_name', type=str, default="")
 
-    parser.add_argument('--agent_num',default=2,type=int)
+    parser.add_argument('--agent_num',default=3,type=int)
     # Comma-separated list of model names/paths for each agent (length will be truncated/padded to agent_num)
-    parser.add_argument('--agent_model_names', default="Qwen2.5-3B,gemma-3-4b", type=str,
+    parser.add_argument('--agent_model_names', default="Qwen2.5-3B,SmolLM3-3B,gemma-3-4b", type=str,
                         help='Comma-separated model names/paths for agents. If empty, uses --model_name for all agents')
     # If set, unload vllm model from memory after an agent finishes generating
     parser.add_argument('--unload_after_agent', action='store_true', help='Unload vllm model after each agent finishes to save GPU memory')

@@ -86,6 +86,19 @@ def load_eval_data(args, agent_index=None, selected = False, data_name=None, mod
     expanded_chat_history = []
     expanded_metadata = {}
 
+    # try to preload the "prev2" file (one agent earlier than the immediate previous)
+    prev2_list = None
+    try:
+        if agent_index is not None and agent_index > 1:
+            if baseline:
+                prev2_path = f"result_dirs/{data_name}/agent{agent_index-2}_baseline_output.json"
+            else:
+                prev2_path = f"result_dirs/{data_name}/agent{agent_index-2}_output.json"
+            if os.path.exists(prev2_path):
+                with open(prev2_path, "r") as _f:
+                    prev2_list = json.load(_f)
+    except Exception:
+        prev2_list = None
     for ind, item in enumerate(dataset):
         orig_session_id = item.get(id_name, f"{data_name}#{ind}")
 
@@ -123,7 +136,36 @@ def load_eval_data(args, agent_index=None, selected = False, data_name=None, mod
                 # We will generate a prompt for this specific reply; to enable prompt_generation to consume it,
                 # we create a temporary item copy where "output" is replaced by the single string out_j.
                 item_copy = dict(item)  # shallow copy; safe if values are primitives/strings
-                item_copy["output"] = out_j
+                # normalize immediate previous output
+                def _normalize(o):
+                    if isinstance(o, str):
+                        return o
+                    try:
+                        return json.dumps(o, ensure_ascii=False)
+                    except Exception:
+                        return str(o)
+
+                out_j_str = _normalize(out_j)
+                item_copy["output"] = out_j_str
+
+                # attach convenient prev fields: prev_output_1 = immediate previous (Critic),
+                # prev_output_2 = one-before-previous (Solver) if available
+                item_copy["prev_output_1"] = out_j_str
+                # default names for compatibility with Reviser templates
+               
+
+                # try to attach prev2 (one agent earlier than the previous) by index alignment
+                prev2_out_str = ""
+                if prev2_list is not None and ind < len(prev2_list):
+                    try:
+                        prev2_item = prev2_list[ind]
+                        prev2_raw = prev2_item.get("output", "")
+                        if isinstance(prev2_raw, list):
+                            prev2_raw = prev2_raw[0] if len(prev2_raw) > 0 else ""
+                        prev2_out_str = _normalize(prev2_raw)
+                    except Exception:
+                        prev2_out_str = ""
+                item_copy["prev_output_2"] = prev2_out_str
                 #print(item_copy)
                 # generate prompt using prompt_generation (try new signature first)
                 try:

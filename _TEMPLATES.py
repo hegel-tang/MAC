@@ -1,6 +1,6 @@
 import json
 
-from templates.Multi_Agent import Parser_prompt,EqBuilder_prompt,Calculator_prompt,Solver_prompt,Critic_prompt
+from templates.Multi_Agent import Parser_prompt,EqBuilder_prompt,Calculator_prompt,Solver_prompt,Critic_prompt,Reviser_prompt
 
 def _select_reply(item_output, selection_mode="first", join_sep="\n"):
     """
@@ -42,12 +42,18 @@ def apply_ma_template(item, agent_index, question_key, reply_selection_mode="fir
         prompt_str = prompt_str.replace("{Solver_output}", solver_output)
         return prompt_str
 
-    # if agent_index == 2:
-    #     eq_output_raw = item.get("output", "")
-    #     eq_output = _select_reply(eq_output_raw, selection_mode=reply_selection_mode)
-    #     prompt_str = Solver_revision_prompt[:]
-    #     prompt_str = prompt_str.replace("{Critic_output}", eq_output)
-    #     return prompt_str
+    if agent_index == 2:
+        solver_output_raw = item.get("prev_output_2", "")
+        solver_output = _select_reply(solver_output_raw, selection_mode=reply_selection_mode)
+        critic_output_raw = item.get("output", "")
+        critic_output = _select_reply(solver_output_raw, selection_mode=reply_selection_mode)
+        origin_question_raw = item.get("question","")
+        origin_question = _select_reply(origin_question_raw, selection_mode=reply_selection_mode)
+        prompt_str = Reviser_prompt[:]
+        prompt_str = prompt_str.replace("{question}", origin_question)
+        prompt_str = prompt_str.replace("{Solver_output}", solver_output)
+        prompt_str = prompt_str.replace("{Critic_output}", critic_output)
+        return prompt_str
 
     # generic fallback
     return ""
