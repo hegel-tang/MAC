@@ -111,99 +111,100 @@ Expected Output:
 
 
 
-Solver_prompt = """
-You are SOLVER.
+# Solver_prompt = """
+# You are SOLVER.
 
-Task: Answer the problem below and produce a concise, structured justification followed by the final answer.
-
-Problem: <{question}>
-
-Output requirements (JSON ONLY, exact keys):
-{
-  "reasoning": "1) ...\n2) ...\n... (max 6 numbered steps; concise, factual — do NOT include raw chain-of-thought)",
-  "answer": "..."  // final answer as a single string; numeric answers may be plain numbers as strings
-}
-
-Rules:
-- Provide at most 6 numbered steps in the reasoning. Each step should be a short, testable statement (not raw internal chain-of-thought).
-- If you perform arithmetic, show the calculations clearly and step-by-step (digit-by-digit style) in the reasoning so the Critic can verify them.
-- Do NOT output any text outside the JSON object.
-- If the question is ambiguous, include one brief clarifying assumption as the final numbered step (e.g., "6) Assumption: X = Y") and proceed using that assumption."""
-# """
-# You are SOLVER. 
+# Task: Answer the problem below and produce a concise, structured justification followed by the final answer.
 
 # Problem: <{question}>
 
-# Please answer this question by first reasoning and then providing your answer.
-# Present your reasoning and solution in the following json format. 
-# Please show your final answer in the `answer` field, e.g.,`"answer": "42"`.
-
-# ```json
+# Output requirements (JSON ONLY, exact keys):
 # {
-#     "reasoning": "___",
-#     "answer": "___"
+#   "reasoning": "1) ...\n2) ...\n... (max 6 numbered steps; concise, factual — do NOT include raw chain-of-thought)",
+#   "answer": "..."  // final answer as a single string; numeric answers may be plain numbers as strings
 # }
-# ```
 
-# """
+# Rules:
+# - Provide at most 6 numbered steps in the reasoning. Each step should be a short, testable statement (not raw internal chain-of-thought).
+# - If you perform arithmetic, show the calculations clearly and step-by-step (digit-by-digit style) in the reasoning so the Critic can verify them.
+# - Do NOT output any text outside the JSON object.
+# - If the question is ambiguous, include one brief clarifying assumption as the final numbered step (e.g., "6) Assumption: X = Y") and proceed using that assumption."""
+Solver_prompt =  """
+You are SOLVER. 
 
-Critic_prompt = """You are CRITIC.
+Problem: <{question}>
 
-Input: the original question <{question}> and the Solver's JSON output <{Solver_output}>.
+Please answer this question by first reasoning and then providing your answer.
+Present your reasoning and solution in the following json format. 
+Please show your final answer in the `answer` field, e.g.,`"answer": "42"`.
+The answer must be a pure number - either an integer or decimal number.
 
-Task:
-1) Validate that <{Solver_output}> is valid JSON and matches the required schema: it must contain "reasoning" (string) and "answer" (string). If not valid JSON or missing keys, return a single issue describing "invalid_json" or "malformed_output".
-2) Check the Solver's "reasoning" for logical, arithmetic, or formatting errors, and check that numeric calculations are correct (recompute arithmetic).
-3) For each issue found, output an item with (error_type, explanation, suggested_fix, step_reference). Use the provided error_type taxonomy below.
-4) Provide an overall confidence score (float 0.0–1.0) representing how confident you are that the final answer is correct.
-5) Set `verdict` to `"accept"` if issues is empty (i.e., solver output is correct and well-formed), else `"revise"`.
-
-Error type taxonomy (use one of these):
-- "arithmetic"
-- "logic"
-- "missing_step"
-- "ambiguous"
-- "invalid_json"
-- "malformed_output"
-
-Output JSON ONLY in this exact format:
+```json
 {
-  "issues": [
-    {"error_type": "arithmetic|logic|missing_step|ambiguous|invalid_json|malformed_output",
-     "explanation": "...",
-     "suggested_fix": "...",
-     "step_reference": "step 2" // or null if not applicable
-    }
-  ],
-  "confidence": 0.85,
-  "confidence_explanation": "one-sentence justification for the numeric confidence",
-  "verdict": "accept" | "revise"
+    "reasoning": "___",
+    "answer": "___"
 }
+```
 
-Notes:
-- If there are no issues, set "issues" to an empty array, "confidence" to a number, and "verdict" to "accept".
-- Be specific in explanations (point to the step number where the problem occurs).
-- Do not include any extra fields."""
+"""
 
-# """
-# You are CRITIC.
+# Critic_prompt = """You are CRITIC.
+
 # Input: the original question <{question}> and the Solver's JSON output <{Solver_output}>.
+
 # Task:
-# 1) Check the Solver's reasoning_summary for *logical or numeric errors*.
-# 2) For each issue found, output an item with (error_type, explanation, suggested_fix).
-# 3) Give an overall confidence score for the solver's final_answer (0.0-1.0).
-# If no issues, say "no_issues".
+# 1) Validate that <{Solver_output}> is valid JSON and matches the required schema: it must contain "reasoning" (string) and "answer" (string). If not valid JSON or missing keys, return a single issue describing "invalid_json" or "malformed_output".
+# 2) Check the Solver's "reasoning" for logical, arithmetic, or formatting errors, and check that numeric calculations are correct (recompute arithmetic).
+# 3) For each issue found, output an item with (error_type, explanation, suggested_fix, step_reference). Use the provided error_type taxonomy below.
+# 4) Provide an overall confidence score (float 0.0–1.0) representing how confident you are that the final answer is correct.
+# 5) Set `verdict` to `"accept"` if issues is empty (i.e., solver output is correct and well-formed), else `"revise"`.
 
-# Output valid JSON ONLY in this format:
+# Error type taxonomy (use one of these):
+# - "arithmetic"
+# - "logic"
+# - "missing_step"
+# - "ambiguous"
+# - "invalid_json"
+# - "malformed_output"
 
+# Output JSON ONLY in this exact format:
 # {
 #   "issues": [
-#     {"error_type": "arithmetic|logic|missing_step|ambiguous", "explanation": "...", "suggested_fix": "..."}
+#     {"error_type": "arithmetic|logic|missing_step|ambiguous|invalid_json|malformed_output",
+#      "explanation": "...",
+#      "suggested_fix": "...",
+#      "step_reference": "step 2" // or null if not applicable
+#     }
 #   ],
 #   "confidence": 0.85,
+#   "confidence_explanation": "one-sentence justification for the numeric confidence",
 #   "verdict": "accept" | "revise"
 # }
-# """
+
+# Notes:
+# - If there are no issues, set "issues" to an empty array, "confidence" to a number, and "verdict" to "accept".
+# - Be specific in explanations (point to the step number where the problem occurs).
+# - Do not include any extra fields."""
+
+Critic_prompt ="""
+You are CRITIC.
+Input: the original question <{question}> and the Solver's JSON output <{Solver_output}>.
+Task:
+1) Check the Solver's reasoning_summary for *logical or numeric errors*.
+2) For each issue found, output an item with (error_type, explanation, suggested_fix).
+3) Give an overall confidence score for the solver's final_answer (0.0-1.0).
+If no issues, say "no_issues".
+
+Output valid JSON ONLY in this format:
+
+{
+  "issues": [
+    {"error_type": "arithmetic|logic|missing_step|ambiguous", "explanation": "...", "suggested_fix": "..."}
+  ],
+  "confidence": 0.85,
+  "verdict": "accept" | "revise"
+}
+"""
 
 # Critic_prompt = """
 # You are CRITIC. Input: the origin question <{question}> and the Solver's JSON output <{Solver_output}>.
@@ -220,56 +221,58 @@ Notes:
 # ```
 
 # """
-Reviser_prompt = """
-You are REVISER.
-
-Input: the original question <{question}>, the Solver's JSON output <{Solver_output}>, and the Critic's JSON output <{Critic_output}>.
-
-Behavior:
-- If Critic.verdict == "accept":
-    - Return the Solver's final answer unchanged, and rewrite the Solver's "reasoning" into a clearer, numbered summary (max 6 steps). Keep the same "answer" value.
-- If Critic.verdict == "revise":
-    - Apply the Critic's suggested_fix(es) to correct the Solver's reasoning and/or calculations.
-    - If the Solver output was malformed/invalid, attempt to extract any salvageable content; otherwise, produce a corrected solution from scratch.
-
-Output JSON ONLY in this exact format:
-{
-  "revised_reasoning": "1) ...\n2) ... (max 6 steps)",
-  "answer": "...",  // final corrected answer as a string
-  "notes": "brief list of fixes applied"
-}
-
-Notes:
-- Be explicit about what was changed in "notes" (e.g., "fixed arithmetic in step 2; clarified assumption X").
-- If you recomputed arithmetic, show the corrected digit-by-digit calculation within the revised_reasoning."""
-
-# """
-# You are REVISER.
-# Input: the original question <{question}>, the Solver's JSON output <{Solver_output}>, and the Critic's JSON output <{Critic_output}>.
-# If Critic.verdict == "accept": return Solver's final_answer but rewrite reasoning_summary to be clearer (still max 6 steps).
-# If Critic.verdict == "revise": apply Critic.suggested_fix(es), correct calculations or steps, and produce an improved solution.
-# Output JSON ONLY:
-
-# {
-#   "revised_reasoning_summary": "1) ...",
-#   "answer": "...",
-#   "notes": "which fixes were applied (brief)"
-# }
-# """
 # Reviser_prompt = """
 # You are REVISER.
 
 # Input: the original question <{question}>, the Solver's JSON output <{Solver_output}>, and the Critic's JSON output <{Critic_output}>.
 
-# Task: Carefully review the Solver's output together with the Critic's feedback. 
-# If the Critic found logical, numeric, or presentation problems, correct them and produce an improved solver response. 
-# If the Critic found no problems, keep the Solver's answer but ensure it is clear, consistent, and well-structured. 
-# Please present your final review reasoning and answer in the following json format.
+# Behavior:
+# - If Critic.verdict == "accept":
+#     - Return the Solver's final answer unchanged, and rewrite the Solver's "reasoning" into a clearer, numbered summary (max 6 steps). Keep the same "answer" value.
+# - If Critic.verdict == "revise":
+#     - Apply the Critic's suggested_fix(es) to correct the Solver's reasoning and/or calculations.
+#     - If the Solver output was malformed/invalid, attempt to extract any salvageable content; otherwise, produce a corrected solution from scratch.
 
-# ```json
+# Output JSON ONLY in this exact format:
 # {
-#     "review_reasoning": "___",
-#     "answer": "___"
+#   "revised_reasoning": "1) ...\n2) ... (max 6 steps)",
+#   "answer": "...",  // final corrected answer as a string
+#   "notes": "brief list of fixes applied"
 # }
-# ```
-# """
+
+# Notes:
+# - Be explicit about what was changed in "notes" (e.g., "fixed arithmetic in step 2; clarified assumption X").
+# - If you recomputed arithmetic, show the corrected digit-by-digit calculation within the revised_reasoning."""
+
+Reviser_prompt = """
+You are REVISER.
+Input: the original question <{question}>, the Solver's JSON output <{Solver_output}>, and the Critic's JSON output <{Critic_output}>.
+If Critic.verdict == "accept": Carefully consider whether solver's answer is reasonable and return your final_answer but rewrite reasoning_summary to be clearer (still max 6 steps). 
+If Critic.verdict == "revise": Carefully consider whether critic's rebuttal is reasonable and decide whether to apply Critic.suggested_fix(es), correct calculations or steps, and produce an improved solution.
+The answer must be a pure number - either an integer or decimal number.
+
+Output JSON ONLY:
+
+{
+  "revised_reasoning_summary": "1) ...",
+  "answer": "...",
+  "notes": "which fixes were applied (brief)"
+}
+"""
+# Reviser_prompt = """
+# You are REVISER.
+
+# # Input: the original question <{question}>, the Solver's JSON output <{Solver_output}>, and the Critic's JSON output <{Critic_output}>.
+
+# # Task: Carefully review the Solver's output together with the Critic's feedback. 
+# # If the Critic found logical, numeric, or presentation problems, correct them and produce an improved solver response. 
+# # If the Critic found no problems, keep the Solver's answer but ensure it is clear, consistent, and well-structured. 
+# # Please present your final review reasoning and answer in the following json format.
+
+# # ```json
+# # {
+# #     "review_reasoning": "___",
+# #     "answer": "___"
+# # }
+# # ```
+# # """
