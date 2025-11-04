@@ -9,25 +9,25 @@ def mapping_task_names(data_name,agent_index,selected,baseline=False):
     Mapping the task names to the dataset and id name.
     """
     id_name = "id"
-    if data_name == "gsm":
-        #dataset = load_dataset("yuchenlin/zero-eval", "gsm", split="test")
-        if agent_index == 0:
+    if agent_index == 0:
+        if data_name == "gsm":
             dataset = load_dataset("json", data_files={"test": "gsm8K.json"}, split="test")
-        else:
-            if selected:
-                path = f"result_dirs/gsm/agent{agent_index}_conf_selected.json"
-                if not os.path.exists(path):
-                    raise FileNotFoundError(f"Expected previous agent outputs at {path} but not found.")
-                dataset = load_dataset("json", data_files={"test": path}, split="test")
-            else: 
-                if baseline:
-                    path = f"result_dirs/gsm/agent{agent_index-1}_baseline_output.json"
-                else:
-                    path = f"result_dirs/gsm/agent{agent_index-1}_output.json"
-                if not os.path.exists(path):
-                    raise FileNotFoundError(f"Expected previous agent outputs at {path} but not found.")
-                dataset = load_dataset("json", data_files={"test": path}, split="test")
-    
+        if data_name == "gsm_hard":
+            dataset = load_dataset("json", data_files={"test": "gsm_hard.json"}, split="test")
+    else:
+        if selected:
+            path = f"result_dirs/{data_name}/agent{agent_index}_conf_selected.json"
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Expected previous agent outputs at {path} but not found.")
+            dataset = load_dataset("json", data_files={"test": path}, split="test")
+        else: 
+            if baseline:
+                path = f"result_dirs/{data_name}/agent{agent_index-1}_baseline_output.json"
+            else:
+                path = f"result_dirs/{data_name}/agent{agent_index-1}_output.json"
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Expected previous agent outputs at {path} but not found.")
+            dataset = load_dataset("json", data_files={"test": path}, split="test")
     return dataset, id_name
 
 def prompt_generation(data_name, data_item, args, agent_index):
@@ -42,7 +42,7 @@ def prompt_generation(data_name, data_item, args, agent_index):
             question_key = "Parser_output"
         if agent_index == 2:
             question_key = "Eqbuilder_output"
-        prompt = apply_ma_template(data_item, agent_index, question_key = question_key)
+        prompt = apply_ma_template(data_name, data_item, agent_index, question_key = question_key)
     
     return prompt
 
