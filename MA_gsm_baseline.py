@@ -25,7 +25,7 @@ import time
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--engine', default="vllm", type=str)
-    parser.add_argument('--output_folder', default="./result_dirs/gsm/", type=str)
+    parser.add_argument('--output_folder', default="./result_dirs/", type=str)
     parser.add_argument('--download_dir', default=None, type=str)
     parser.add_argument('--model_name', default="/home/ubuntu/gemma-3-4b", type=str)
     parser.add_argument('--model_pretty_name', default=None, type=str)
@@ -65,9 +65,9 @@ def parse_args():
     # parser.add_argument('--cot', type=str, default="True")
     parser.add_argument('--run_name', type=str, default="")
 
-    parser.add_argument('--agent_num',default=3,type=int)
+    parser.add_argument('--agent_num',default=1,type=int)
     # Comma-separated list of model names/paths for each agent (length will be truncated/padded to agent_num)
-    parser.add_argument('--agent_model_names', default="Qwen2.5-3B,SmolLM3-3B,gemma-3-4b", type=str,
+    parser.add_argument('--agent_model_names', default="SmolLM3-3B", type=str,
                         help='Comma-separated model names/paths for agents. If empty, uses --model_name for all agents')
     # If set, unload vllm model from memory after an agent finishes generating
     parser.add_argument('--unload_after_agent', action='store_true', help='Unload vllm model after each agent finishes to save GPU memory')
@@ -356,9 +356,9 @@ if __name__ == "__main__":
         # Decide the output filepath for this agent
         if args.filepath == "auto":
             if end_index == -1 and start_index == 0:
-                filepath = f"{args.output_folder}/agent{agent_idx}_baseline_output.json" if agent_idx > 0 else f"{args.output_folder}/agent0_baseline_output.json"
+                filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_baseline_output.json" if agent_idx > 0 else f"{args.output_folder}/{args.data_name}/agent0_baseline_output.json"
             else:
-                filepath = f"{args.output_folder}/agent{agent_idx}.{start_index}-{end_index}_output.json" if agent_idx > 0 else f"{args.output_folder}/agent0.{start_index}-{end_index}_output.json"
+                filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}.{start_index}-{end_index}_output.json" if agent_idx > 0 else f"{args.output_folder}/{args.data_name}/agent0.{start_index}-{end_index}_output.json"
         else:
             # if explicit filepath given, append agent suffix to avoid overwrite
             base, ext = os.path.splitext(args.filepath)
