@@ -25,7 +25,7 @@ import time
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--engine', default="vllm", type=str)
-    parser.add_argument('--output_folder', default="./result_dirs/gsm/", type=str)
+    parser.add_argument('--output_folder', default="./result_dirs/", type=str)
     parser.add_argument('--download_dir', default=None, type=str)
     parser.add_argument('--model_name', default="/home/ubuntu/gemma-3-4b", type=str)
     parser.add_argument('--model_pretty_name', default=None, type=str)
@@ -35,13 +35,13 @@ def parse_args():
     parser.add_argument('--tokenizer_mode', type=str, default="auto")
     parser.add_argument('--data_name', default="gsm", type=str)
     parser.add_argument('--batch_size', default=4, type=int)
-    parser.add_argument('--num_outputs', default=3, type=int)
+    parser.add_argument('--num_outputs', default=8, type=int)
     parser.add_argument('--sample_num', default=8, type=int)
     parser.add_argument('--top_p',default=0.9, type=float)
     parser.add_argument('--temperature',default=0.7, type=float)
     parser.add_argument('--repetition_penalty',default=1, type=float)
-    parser.add_argument('--max_tokens',default=1000, type=int)
-    parser.add_argument('--max_model_len',default=4096, type=int)
+    parser.add_argument('--max_tokens',default=4096, type=int)
+    parser.add_argument('--max_model_len',default=-1, type=int)
     parser.add_argument('--num_shards', default=1, type=int)
     parser.add_argument('--shard_id', default=0, type=int)
     parser.add_argument('--start_index',default=0, type=int) # 0 means from the beginning of the list
@@ -66,9 +66,9 @@ def parse_args():
     # parser.add_argument('--cot', type=str, default="True")
     parser.add_argument('--run_name', type=str, default="")
 
-    parser.add_argument('--agent_num',default=2,type=int)
+    parser.add_argument('--agent_num',default=3,type=int)
     # Comma-separated list of model names/paths for each agent (length will be truncated/padded to agent_num)
-    parser.add_argument('--agent_model_names', default="Qwen2.5-3B,gemma-3-4b", type=str,
+    parser.add_argument('--agent_model_names', default="Qwen2.5-3B-Instruct,SmolLM3-3B,gemma-3-4b", type=str,
                         help='Comma-separated model names/paths for agents. If empty, uses --model_name for all agents')
     # If set, unload vllm model from memory after an agent finishes generating
     parser.add_argument('--unload_after_agent', action='store_true', help='Unload vllm model after each agent finishes to save GPU memory')
@@ -357,9 +357,9 @@ if __name__ == "__main__":
         # Decide the output filepath for this agent
         if args.filepath == "auto":
             if end_index == -1 and start_index == 0:
-                filepath = f"{args.output_folder}/agent{agent_idx}_temp_output.json" if agent_idx > 0 else f"{args.output_folder}/agent0_output.json"
+                filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_temp_output.json" if agent_idx > 0 else f"{args.output_folder}/{args.data_name}/agent0_output.json"
             else:
-                filepath = f"{args.output_folder}/agent{agent_idx}.{start_index}-{end_index}_output.json" if agent_idx > 0 else f"{args.output_folder}/agent0.{start_index}-{end_index}_output.json"
+                filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}.{start_index}-{end_index}_output.json" if agent_idx > 0 else f"{args.output_folder}/{args.data_name}/agent0.{start_index}-{end_index}_output.json"
         else:
             # if explicit filepath given, append agent suffix to avoid overwrite
             base, ext = os.path.splitext(args.filepath)
@@ -444,7 +444,11 @@ if __name__ == "__main__":
 
                 # final save
                 save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-                conf_gpu_id = "1"  
+
+                print(f"Agent {agent_idx}: unloading agent LLM to free GPU memory (unload_after_agent=True)")
+                unload_agent_llm(agent_idx)
+                print(f"Agent {agent_idx}: starting confidence calculation and selection...")
+                conf_gpu_id = "0"  
                 tmp_conf_out = f"{args.output_folder}/agent{agent_idx}_conf.json"
 
                 python_exe = shlex.quote(sys.executable) if 'shlex' in globals() else sys.executable
@@ -495,7 +499,7 @@ if __name__ == "__main__":
                     if 0 <= idx < len(confidence_dict):
                         selected_items.append(confidence_dict[idx])
 
-                selected_output_file = f"{args.output_folder}/agent{agent_idx}_conf_selected.json"
+                selected_output_file = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_conf_selected.json"
 
                 os.makedirs(os.path.dirname(selected_output_file) or ".", exist_ok=True)
 
@@ -503,6 +507,15 @@ if __name__ == "__main__":
                     json.dump(selected_items, f, ensure_ascii=False, indent=2)
 
                 print(f"\n=== Agent {agent_idx} starts to generate completely ===")
+                if args.engine == "vllm":
+                    if llm_list[agent_idx] is None:
+                        agent_llm, agent_lora_request = load_agent_llm(agent_idx)
+                    else:
+                        agent_llm = llm_list[agent_idx]
+                        agent_lora_request = lora_requests[agent_idx]
+                else:
+                    agent_llm = llm_list[agent_idx]
+                    agent_lora_request = lora_requests[agent_idx]
                 
                 id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=True, model_name=model_name_for_agent)
                 
@@ -535,9 +548,9 @@ if __name__ == "__main__":
                 if args.filepath == "auto":
                     # file per agent
                     if end_index == -1 and start_index == 0:
-                        filepath = f"{args.output_folder}/agent{agent_idx}_output.json"
+                        filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_output.json"
                     else:
-                        filepath = f"{args.output_folder}/agent{agent_idx}.{start_index}-{end_index}_output.json"
+                        filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}.{start_index}-{end_index}_output.json"
 
                 else:
                     # if explicit filepath given, append agent suffix to avoid overwrite
@@ -678,8 +691,8 @@ if __name__ == "__main__":
             
 
     print("\nAll agents finished. Outputs saved per agent in:", args.output_folder)
-    conf_gpu_id = "1"  
-    tmp_conf_out = f"{args.output_folder}/final_conf.json"
+    conf_gpu_id = "0"  
+    tmp_conf_out = f"{args.output_folder}/{args.data_name}/final_conf.json"
 
     python_exe = shlex.quote(sys.executable) if 'shlex' in globals() else sys.executable
 
@@ -727,7 +740,7 @@ if __name__ == "__main__":
         selected_items.append({"session_id": sess, "model_inputs":input,"output": [sel_out], "generator":generator,"dataset":dataset,"question":question,"answer":answer,"confidence": [sel_conf]})
     print(1)
     # write final answers
-    selected_output_file = f"{args.output_folder}/MA_final_answer.json"
+    selected_output_file = f"{args.output_folder}/{args.data_name}/MA_final_answer.json"
     os.makedirs(os.path.dirname(selected_output_file) or ".", exist_ok=True)
     with open(selected_output_file, "w", encoding="utf-8") as f:
         json.dump(selected_items, f, ensure_ascii=False, indent=2)
