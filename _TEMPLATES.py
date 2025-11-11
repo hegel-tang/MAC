@@ -77,7 +77,7 @@ def apply_ma_template(data_name, item, agent_index, question_key, reply_selectio
             solver_output_raw = item.get("prev_output_2", "")
             solver_output = _select_reply(solver_output_raw, selection_mode=reply_selection_mode)
             critic_output_raw = item.get("output", "")
-            critic_output = _select_reply(solver_output_raw, selection_mode=reply_selection_mode)
+            critic_output = _select_reply(critic_output_raw, selection_mode=reply_selection_mode)
             origin_question_raw = item.get("question","")
             origin_question = _select_reply(origin_question_raw, selection_mode=reply_selection_mode)
             prompt_str = Reviser_prompt[:]
