@@ -102,7 +102,6 @@ def eval_model(model, filepath):
 
         reason_lens.append(len(reason))
 
-        parsed_item["reasoning"] = reason
         parsed_item["model_answer"] = {"raw": raw_model_answer, "sanitized": model_answer, "first_number": first_number_in_model_answer.group() if first_number_in_model_answer else None}
         parsed_item["correct_answer"] = {"raw": correct_answer, "sanitized": correct_answer, "first_number": first_number_in_correct_answer.group() if first_number_in_correct_answer else None}
         parsed_item["matched"] = correct
@@ -116,7 +115,6 @@ def eval_model(model, filepath):
     result["Acc"] = f"{solved_examples/num_total_examples*100:.2f}"
     result["No answer"] = f"{no_answer/num_total_examples*100:.2f}"
     result["Total"] = num_total_examples
-    result["Reason Lens"] = f"{sum(reason_lens)/len(reason_lens):.2f}"
     result["Model"] = model_name_replacement(result["Model"])
     return result, parsed_results
 
@@ -326,7 +324,7 @@ def eval_model_first_answered(model, filepath, best_N):
 def gen_results(run_name_folders, mode="eval", best_N=-1):
     model_results = load_model_results(run_name_folders)
 
-    columns = ["Model", "Mode", "Acc", "No answer", "Total", "Reason Lens"]
+    columns = ["Model", "Mode", "Acc", "No answer", "Total"]
     rows = []
     for model_name, filepath in model_results.items(): 
         if mode == "best":
@@ -379,3 +377,4 @@ if __name__ == "__main__":
         gen_results(run_name_folders, mode="best", best_N=args.best_N)
     elif mode == "first_answered":
         gen_results(run_name_folders, mode="first_answered", best_N=args.best_N)
+
