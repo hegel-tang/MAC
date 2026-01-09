@@ -1,26 +1,387 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-# Avoid tokenizers parallelism warning when processes are forked
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-import requests
-from typing import List
-import argparse
-from datasets import load_dataset
-from tqdm import tqdm
-import json
-import os
+
+  import os
 import sys
+import json
+import gc
+import time
+import argparse
+import subprocess
+import shlex
+from typing import List, Dict, Optional
+from tqdm import tqdm
+
+# Environment setup
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from unified_utils import load_eval_data, save_outputs
 from global_configs import HF_TEMPLATED_MODELS, IM_END_MODELS
 from hf_models import DecoderOnlyModelManager
 from transformers import AutoTokenizer
-import subprocess
-import shlex
-import gc
-import time
-#from ma_confidence import compute_confidence_from_file
-# import multiprocessing as mp
-# mp.set_start_method('spawn', force=True)
+
+# --- Helper Classes ---
+
+class LLMController:
+    """
+    Handles Model Loading, Unloading, and Generation (vLLM & HF).
+    """
+    def __init__(self, args, agent_idx, model_name):
+        self.args = args
+        self.agent_idx = agent_idx
+        self.model_name = model_name
+        self.llm = None
+        self.lora_request = None
+        self.engine_type = args.engine
+
+    def _infer_maybe_lora(self, model_name):
+        if os.path.exists(model_name):
+            if os.path.exists(f"{model_name}/adapter_config.json"):
+                return model_name, model_name 
+            else:
+                return model_name, None
+        else:
+            from huggingface_hub import hf_hub_download, snapshot_download
+            try:
+                adapter_config_path = hf_hub_download(repo_id=model_name, filename="adapter_config.json")
+                adapter_path = snapshot_download(repo_id=model_name)
+                with open(adapter_config_path) as f:
+                    adapter_config = json.load(f)
+                return adapter_config["base_model_name_or_path"], adapter_path
+            except Exception:
+                return model_name, None
+
+    def load(self):
+        print(f"[{self.agent_idx}] Loading model: {self.model_name} ({self.engine_type})")
+        if self.engine_type == "vllm":
+            from vllm import LLM
+            base_model, lora_path = self._infer_maybe_lora(self.model_name)
+            
+            if lora_path:
+                from vllm.lora.request import LoRARequest
+                self.lora_request = LoRARequest(lora_path.split("/")[-1], 1, lora_path)
+            
+            trial_util = self.args.gpu_memory_utilization
+            for attempt in range(3):
+                try:
+                    self.llm = LLM(
+                        model=base_model,
+                        tokenizer=self.model_name if self.args.tokenizer_name == "auto" else self.args.tokenizer_name,
+                        tensor_parallel_size=self.args.tensor_parallel_size,
+                        download_dir=self.args.download_dir,
+                        dtype=self.args.dtype,
+                        tokenizer_mode=self.args.tokenizer_mode,
+                        max_model_len=None if self.args.max_model_len == -1 else self.args.max_model_len,
+                        trust_remote_code=True,
+                        gpu_memory_utilization=trial_util,
+                        enable_lora=(self.lora_request is not None),
+                        max_num_seqs=128,
+                        enable_sleep_mode=True
+                    )
+                    break
+                except Exception as e:
+                    if "memory" in str(e).lower():
+                        trial_util = max(0.2, trial_util - 0.2)
+                        print(f"[{self.agent_idx}] Memory error, retrying with util={trial_util}...")
+                    else:
+                        raise e
+        elif self.engine_type == "hf":
+            self.llm = DecoderOnlyModelManager(self.model_name, self.model_name, cache_dir=self.args.download_dir,
+                                               bf16=self.args.hf_bf16, gptq=self.args.hf_gptq)
+            self.llm.load_model()
+        return self.llm
+
+    def unload(self):
+        if self.llm is None: return
+        print(f"[{self.agent_idx}] Unloading model...")
+        if self.engine_type == "vllm":
+            try:
+                self.llm.sleep(level=2)
+            except: pass
+        self.llm = None
+        self.lora_request = None
+        import torch
+        try:
+            torch.cuda.empty_cache()
+        except: pass
+        gc.collect()
+        self._wait_for_gpu_free()
+
+    def _wait_for_gpu_free(self, required_free_gb=None, timeout=60):
+        if required_free_gb is None: required_free_gb = 5.0 
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits", "-i", "0"])
+                free_gb = int(out.decode().strip()) / 1024.0
+                if free_gb >= required_free_gb: return
+            except:
+                time.sleep(5)
+                return
+            time.sleep(2)
+
+    def get_stop_tokens(self):
+        stop_words = []
+        stop_token_ids = []
+        try:
+            hf_tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+            if self.model_name in IM_END_MODELS:
+                for token in ["<|im_end|>", "<|eot_id|>"]:
+                    if token in hf_tokenizer.get_vocab():
+                        stop_token_ids.append(hf_tokenizer.get_vocab()[token])
+            if self.model_name in HF_TEMPLATED_MODELS:
+                stop_token_ids.append(hf_tokenizer.eos_token_id)
+        except: pass
+        return stop_words, stop_token_ids
+
+    def generate(self, inputs, n_samples, max_tokens, temperature, top_p):
+        if self.llm is None: self.load()
+        outputs_text = []
+        
+        if self.engine_type == "vllm":
+            from vllm import SamplingParams
+            stop_words, stop_ids = self.get_stop_tokens()
+            sampling_params = SamplingParams(
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=self.args.repetition_penalty,
+                max_tokens=max_tokens,
+                stop=stop_words,
+                stop_token_ids=stop_ids,
+                n=n_samples
+            )
+            for cur_id in tqdm(range(0, len(inputs), self.args.batch_size), desc=f"Agent {self.agent_idx} Gen"):
+                batch_inputs = inputs[cur_id : cur_id + self.args.batch_size]
+                batch_res = self.llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=self.lora_request)
+                batch_out = [[o.text for o in x.outputs] for x in batch_res]
+                outputs_text.extend(batch_out)
+                yield batch_out, cur_id, batch_inputs
+                
+        elif self.engine_type == "hf":
+            gen_args = { "num_outputs": n_samples, "max_output_tokens": max_tokens, "temperature": temperature, "top_p": top_p }
+            for cur_id in tqdm(range(0, len(inputs), self.args.batch_size), desc=f"Agent {self.agent_idx} Gen (HF)"):
+                batch_inputs = inputs[cur_id : cur_id + self.args.batch_size]
+                batch_out = self.llm.infer_generate(batch_inputs, args=gen_args)
+                outputs_text.extend(batch_out)
+                yield batch_out, cur_id, batch_inputs
+
+
+class SelectionManager:
+    """
+    Handles confidence calculation and selection.
+    """
+    @staticmethod
+    def _run_worker(args, agent_idx, input_file, model_name, output_file):
+        conf_gpu_id = "0"
+        print(f"[{agent_idx}] Computing confidence (Worker)...")
+        cmd = [
+            sys.executable,
+            "MAC/compute_conf_worker.py", 
+            conf_gpu_id,
+            input_file,
+            model_name,
+            output_file,
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = conf_gpu_id
+        ret = subprocess.run(cmd, env=env)
+        if ret.returncode != 0:
+            raise RuntimeError(f"compute_conf_worker failed for Agent {agent_idx}")
+
+    @staticmethod
+    def select_best_solver_path_with_dual_lookup(args, agent_idx, evaluator_conf_path, solver_original_conf_path):
+        """
+        Dual Lookup Selection:
+        1. Read 'evaluator_conf_path' (Agent 1 Short Gen) to find the INDEX of the best path.
+           (Because Critic Evaluation is more reliable for selection).
+        2. Read 'solver_original_conf_path' (Agent 0 Original Gen) to get the CONFIDENCE SCORE at that index.
+           (Because we need to compare apples to apples in the final step: Raw Solver Conf vs Raw Reviser Conf).
+        """
+        with open(evaluator_conf_path, "r", encoding="utf-8") as f:
+            eval_confs = json.load(f)
+            
+        with open(solver_original_conf_path, "r", encoding="utf-8") as f:
+            solver_confs = json.load(f)
+            
+        # Structure Check:
+        # Solver (Agent 0) generated `args.num_outputs` candidates per question.
+        # Evaluator (Agent 1) generated `args.sample_num` samples for EACH Solver candidate.
+        # So `eval_confs` should be roughly `args.sample_num` times larger (or structured differently) than `solver_confs`.
+        
+        # NOTE: compute_conf_worker usually returns a flat list where each entry corresponds to one generation call.
+        # Agent 0 Gen: 1 input -> N outputs. Worker calculates N scores.
+        # Agent 1 Gen: N inputs -> M samples each. Worker calculates N*M scores.
+        
+        # Let's align based on the assumption that lists are ordered by Question -> Candidate.
+        
+        selected_items = []
+        
+        # Number of Solver Candidates per Question
+        n_solver_cands = args.num_outputs
+        
+        # We iterate through the SOLVER'S confidence list (since we want to pick 1 out of N solver cands)
+        # But we loop carefully to match indices.
+        
+        # Pointers
+        ptr_eval = 0
+        
+        # We assume solver_confs is a flat list of all candidates generated by Agent 0.
+        # It is grouped by Question implicitly: [Q1_C1, Q1_C2... Q1_CN, Q2_C1...]
+        
+        # We iterate in chunks of `n_solver_cands` (one Question's worth of Solver candidates)
+        for i in range(0, len(solver_confs), n_solver_cands):
+            solver_chunk = solver_confs[i : i + n_solver_cands]
+            if not solver_chunk: continue
+            
+            best_eval_score = -1.0
+            best_idx_in_chunk = -1
+            
+            # For each candidate in this question, look at Evaluator scores
+            for j in range(len(solver_chunk)):
+                # The Evaluator generated `args.sample_num` samples for this specific candidate.
+                # In the flat `eval_confs` list, these take up `args.sample_num` slots.
+                
+                # Check bounds
+                if ptr_eval >= len(eval_confs): break
+                
+                # Extract the chunk of Evaluator scores for Solver Candidate j
+                # Note: `compute_conf_worker` output usually groups samples for one prompt in `confidence_list`
+                # IF Agent 1 generated M samples per prompt.
+                
+                eval_item = eval_confs[ptr_eval]
+                confs = eval_item.get("confidence_list", [])
+                
+                # Calculate mean confidence of Critic's evaluation (Short Gen)
+                avg_eval_conf = sum(confs) / len(confs) if confs else 0.0
+                
+                if avg_eval_conf > best_eval_score:
+                    best_eval_score = avg_eval_conf
+                    best_idx_in_chunk = j
+                
+                ptr_eval += 1
+            
+            if best_idx_in_chunk != -1:
+                # SELECTION: We pick the solver candidate at `best_idx_in_chunk`
+                chosen_solver_item = solver_chunk[best_idx_in_chunk]
+                
+                # LOOKUP: We retrieve the ORIGINAL score from Agent 0
+                original_conf_list = chosen_solver_item.get("confidence_list", [])
+                original_score = sum(original_conf_list)/len(original_conf_list) if original_conf_list else 0.0
+                
+                # Construct the selected item for next stage
+                # We save the Agent 0 item (which contains the answer/model_input)
+                # And we inject the `original_solver_score` for later comparison.
+                chosen_solver_item["original_solver_score"] = original_score
+                
+                # Optional: We can also save `evaluator_score` for debugging
+                chosen_solver_item["evaluator_score"] = best_eval_score
+                
+                selected_items.append(chosen_solver_item)
+
+        out_path = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_input_selected.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(selected_items, f, ensure_ascii=False, indent=2)
+        return out_path
+
+    @staticmethod
+    def select_best_output(args, agent_idx, conf_json_path):
+        """
+        Scenario: Agent 1 Final Full Gen.
+        Goal: Select the best OUTPUT based on its own confidence.
+        """
+        with open(conf_json_path, "r", encoding="utf-8") as f:
+            confidence_dict = json.load(f)
+            
+        selected_items = []
+        chunk_size = args.num_outputs 
+        
+        for i in range(0, len(confidence_dict), chunk_size):
+            chunk = confidence_dict[i : i + chunk_size]
+            if not chunk: continue
+            
+            best_val = -1.0
+            best_idx = -1
+            
+            for j, rec in enumerate(chunk):
+                confs = rec.get("confidence_list", [])
+                avg_conf = sum(confs) / len(confs) if confs else 0.0
+                if avg_conf > best_val:
+                    best_val = avg_conf
+                    best_idx = j
+                    
+            if best_idx != -1:
+                best_item = chunk[best_idx]
+                best_item["final_confidence_score"] = best_val
+                selected_items.append(best_item)
+                
+        out_path = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_final_selected.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(selected_items, f, ensure_ascii=False, indent=2)
+        return out_path
+
+
+# --- Final Comparison Logic ---
+def run_final_confidence_comparison(args, input_selection_file, reviser_file):
+    """
+    input_selection_file: Contains the chosen Agent 0 output (with 'original_solver_score').
+    reviser_file: Contains Agent 1's Final Full Output (with 'final_confidence_score').
+    """
+    print("\n=== Running Scheme 2: Confidence Comparison (Solver Original vs Reviser Final) ===")
+    
+    with open(input_selection_file, 'r', encoding='utf-8') as f:
+        solver_data = json.load(f)
+    with open(reviser_file, 'r', encoding='utf-8') as f:
+        reviser_data = json.load(f)
+        
+    solver_map = {x['session_id']: x for x in solver_data}
+    
+    final_results = []
+    count_solver = 0
+    count_reviser = 0
+    
+    for rev_item in reviser_data:
+        sid = rev_item.get('session_id')
+        if sid not in solver_map: continue
+            
+        sol_item = solver_map[sid]
+        
+        # CORRECTED LOGIC: 
+        # Conf(Solver) is the Original Agent 0 Confidence (Baseline)
+        conf_sol = sol_item.get("original_solver_score", 0.0)
+        # Conf(Reviser) is Agent 1's Final Confidence
+        conf_rev = rev_item.get("final_confidence_score", 0.0)
+        
+        # Formula
+        if conf_rev > conf_sol + args.confidence_delta:
+            final_output = rev_item.get("output") # Accept Reviser
+            source = "reviser"
+            count_reviser += 1
+        else:
+            # We revert to Solver.
+            # sol_item comes from `agent0_output.json`, so its "output" field IS the Solver's answer.
+            # However, `output` is a list `[text]`.
+            final_output = sol_item.get("output")
+            source = "solver"
+            count_solver += 1
+            
+        final_entry = {
+            "session_id": sid,
+            "output": final_output, 
+            "final_answer": rev_item.get("answer", ""), # GT
+            "selected_source": source,
+            "solver_original_conf": conf_sol,
+            "reviser_final_conf": conf_rev,
+            "delta": args.confidence_delta
+        }
+        final_results.append(final_entry)
+        
+    print(f"Comparison Done. Reviser Accepted: {count_reviser}, Solver Kept: {count_solver}")
+    
+    out_path = f"{args.output_folder}/{args.data_name}/MA_final_answer.json"
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(final_results, f, indent=2, ensure_ascii=False)
+
+
+# --- Main Pipeline ---
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -28,15 +389,14 @@ def parse_args():
     parser.add_argument('--output_folder', default="./result_dirs/", type=str)
     parser.add_argument('--download_dir', default=None, type=str)
     parser.add_argument('--model_name', default="/home/ubuntu/gemma-3-4b", type=str)
-    parser.add_argument('--model_pretty_name', default=None, type=str)
     parser.add_argument('--tokenizer_name', default="auto", type=str)
     parser.add_argument('--tensor_parallel_size', type=int, default=1)
     parser.add_argument('--dtype', type=str, default="auto")
     parser.add_argument('--tokenizer_mode', type=str, default="auto")
     parser.add_argument('--data_name', default="gsm", type=str)
     parser.add_argument('--batch_size', default=4, type=int)
-    parser.add_argument('--num_outputs', default=8, type=int)
-    parser.add_argument('--sample_num', default=8, type=int)
+    parser.add_argument('--num_outputs', default=8, type=int) # Agent 0 Candidates
+    parser.add_argument('--sample_num', default=8, type=int)  # Agent 1 Short Gen Samples
     parser.add_argument('--top_p',default=0.9, type=float)
     parser.add_argument('--temperature',default=0.7, type=float)
     parser.add_argument('--repetition_penalty',default=1, type=float)
@@ -44,707 +404,162 @@ def parse_args():
     parser.add_argument('--max_model_len',default=-1, type=int)
     parser.add_argument('--num_shards', default=1, type=int)
     parser.add_argument('--shard_id', default=0, type=int)
-    parser.add_argument('--start_index',default=0, type=int) # 0 means from the beginning of the list
-    parser.add_argument('--end_index',default=-1, type=int) # -1 means to the end of the list
+    parser.add_argument('--start_index',default=0, type=int) 
+    parser.add_argument('--end_index',default=-1, type=int)
     parser.add_argument('--filepath',default="auto", type=str)
-
     parser.add_argument('--cache_filepath', default=None, type=str)
-
-    parser.add_argument('--follow_up_mode', default="N/A", type=str) # N/A means not a follow up
-    parser.add_argument('--follow_up_file', default=None, type=str) # if you have an existing file
-
     parser.add_argument('--overwrite', action='store_true')
-    parser.add_argument('--no_repeat_ngram_size', default=0, type=int)
     parser.add_argument('--hf_bf16', action='store_true')
     parser.add_argument('--hf_gptq', action='store_true')
     parser.add_argument('--gpu_memory_utilization', default=0.8, type=float)
-
-    parser.add_argument('--use_hf_conv_template', action='store_true')
-    parser.add_argument('--use_imend_stop', action='store_true')
-
-    # only for MT-bench; not useful for other benchmarks
-    # parser.add_argument('--cot', type=str, default="True")
-    parser.add_argument('--run_name', type=str, default="")
-
     parser.add_argument('--agent_num',default=3,type=int)
-    # Comma-separated list of model names/paths for each agent (length will be truncated/padded to agent_num)
-    parser.add_argument('--agent_model_names', default="Qwen2.5-3B-Instruct,SmolLM3-3B,gemma-3-4b", type=str,
-                        help='Comma-separated model names/paths for agents. If empty, uses --model_name for all agents')
-    # If set, unload vllm model from memory after an agent finishes generating
-    parser.add_argument('--unload_after_agent', action='store_true', help='Unload vllm model after each agent finishes to save GPU memory')
+    parser.add_argument('--agent_model_names', default="", type=str)
+    parser.add_argument('--unload_after_agent', action='store_true')
+    parser.add_argument('--confidence_delta', default=0.05, type=float)
     return parser.parse_args()
 
-def infer_maybe_lora(model_name):
-    if os.path.exists(model_name):
-        if os.path.exists(f"{model_name}/adapter_config.json"):
-            adapter_config_path = f"{model_name}/adapter_config.json"
-            adapter_path = model_name
-            lora_model = True
-        else:
-            lora_model = False
+def get_agent_model_list(args):
+    if args.agent_model_names:
+        candidate = [x.strip() for x in args.agent_model_names.split(",") if x.strip()]
     else:
-        # try hugging face
-        from huggingface_hub import hf_hub_download, snapshot_download
-        try:
-            adapter_config_path = hf_hub_download(repo_id=model_name, filename="adapter_config.json")
-            adapter_path = snapshot_download(repo_id=model_name)
-            lora_model = True
-        except Exception as e:
-            lora_model = False
-    if lora_model:
-        with open(adapter_config_path) as f:
-            adapter_config = json.load(f)
-        base_model_name_or_path = adapter_config["base_model_name_or_path"]
-        lora_model = adapter_path
-    else:
-        base_model_name_or_path = model_name
-        lora_model = None
-    return base_model_name_or_path, lora_model
+        candidate = []
+    final_list = []
+    for i in range(args.agent_num):
+        if i < len(candidate): final_list.append(candidate[i])
+        else: final_list.append(args.model_name)
+    return final_list
 
-def sanitize_args(args):
-    if args.download_dir == "default":
-        args.download_dir = None
-    return args
+def determine_filepath(args, agent_idx):
+    if args.filepath == "auto":
+        prefix = f"agent{agent_idx}"
+        return f"{args.output_folder}/{args.data_name}/{prefix}_output.json"
+    else:
+        base, ext = os.path.splitext(args.filepath)
+        return f"{base}.agent{agent_idx}{ext}"
+
+def main():
+    args = parse_args()
+    if args.download_dir == "default": args.download_dir = None
+    os.makedirs(f"{args.output_folder}/{args.data_name}", exist_ok=True)
+    
+    agent_models = get_agent_model_list(args)
+    
+    input_selection_file = None # Stores Chosen Agent 0 output (with original score)
+    reviser_final_file = None   # Stores Agent 1 Final output (with final score)
+    solver_conf_path = None     # Path to Agent 0's confidence file
+    
+    for agent_idx in range(args.agent_num):
+        current_model_name = agent_models[agent_idx]
+        print(f"\n{'='*20} Agent {agent_idx} ({current_model_name}) {'='*20}")
+        output_filepath = determine_filepath(args, agent_idx)
+        controller = LLMController(args, agent_idx, current_model_name)
+        
+        # === Agent 0: Generate -> Compute RAW Confidence ===
+        if agent_idx == 0:
+            id_strs, chat_history, model_inputs, metadata = load_eval_data(args, agent_idx, selected=False, model_name=current_model_name)
+            
+            outputs = []
+            if os.path.exists(output_filepath) and not args.overwrite:
+                 with open(output_filepath, 'r') as f: existing = json.load(f)
+                 outputs = [[x["output"]] if isinstance(x["output"], str) else x["output"] for x in existing]
+                 print(f"Skipping {len(outputs)} existing entries.")
+            
+            inputs_to_run = model_inputs[len(outputs):]
+            if inputs_to_run:
+                gen_iter = controller.generate(inputs_to_run, args.num_outputs, args.max_tokens, args.temperature, args.top_p)
+                for batch_out, _, _ in gen_iter:
+                    outputs.extend(batch_out)
+                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, output_filepath, model_name=current_model_name)
+            
+            # --- NEW STEP: Compute Agent 0 Original Confidence ---
+            print(f"[{agent_idx}] Computing Solver Original Confidence...")
+            controller.unload() # Unload before conf calc
+            
+            solver_conf_path = output_filepath.replace(".json", "_conf.json")
+            SelectionManager._run_worker(args, agent_idx, output_filepath, current_model_name, solver_conf_path)
+            
+            if args.unload_after_agent: controller.unload()
+
+        # === Agent > 0 (Reviser): Eval Agent 0 -> Select -> Full Gen ===
+        else:
+            # 1. Load Agent 0's RAW outputs (Evaluator Input)
+            id_strs, chat_history, model_inputs, metadata = load_eval_data(args, agent_idx, selected=False, model_name=current_model_name)
+            
+            # 2. Short Generation (Evaluation)
+            print(f"[{agent_idx}] Phase 1: Short Generation (Evaluating Agent {agent_idx-1} outputs)...")
+            temp_short_gen_path = output_filepath.replace(".json", "_short_eval.json")
+            
+            outputs = []
+            if os.path.exists(temp_short_gen_path) and not args.overwrite:
+                 with open(temp_short_gen_path, 'r') as f: existing = json.load(f)
+                 outputs = [[x["output"]] if isinstance(x["output"], str) else x["output"] for x in existing]
+            
+            inputs_to_run = model_inputs[len(outputs):]
+            if inputs_to_run:
+                gen_iter = controller.generate(inputs_to_run, args.sample_num, max_tokens=64, temperature=args.temperature, top_p=args.top_p)
+                for batch_out, _, _ in gen_iter:
+                    outputs.extend(batch_out)
+                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, temp_short_gen_path, model_name=current_model_name)
+            
+            controller.unload()
+            
+            # 3. Compute Confidence on Short Gen
+            evaluator_conf_path = temp_short_gen_path.replace(".json", "_conf.json")
+            SelectionManager._run_worker(args, agent_idx, temp_short_gen_path, current_model_name, evaluator_conf_path)
+            
+            # 4. DUAL LOOKUP SELECTION
+            # Use Evaluator Score to Select Path; Fetch Original Solver Score for Record
+            print(f"[{agent_idx}] Phase 2: Dual Lookup Selection...")
+            if solver_conf_path is None:
+                # Fallback if Agent 0 file calculation failed or manual run separation
+                solver_conf_path = output_filepath.replace(f"agent{agent_idx}", f"agent{agent_idx-1}").replace(".json", "_conf.json")
+
+            input_selection_file = SelectionManager.select_best_solver_path_with_dual_lookup(args, agent_idx, evaluator_conf_path, solver_conf_path)
+            print(f"Selected Solver inputs (with original scores) saved to: {input_selection_file}")
+            
+            # 5. Full Generation (Refinement)
+            print(f"[{agent_idx}] Phase 3: Full Generation (Refining Selected Answer)...")
+            controller.load()
+            
+            with open(input_selection_file, 'r', encoding='utf-8') as f:
+                selected_data = json.load(f)
+            
+            # Extract inputs directly from the selection file
+            # These inputs are essentially "Agent 0 Output + History"
+            inputs_sel = [x["model_inputs"] for x in selected_data] 
+            id_strs_sel = [x["session_id"] for x in selected_data]
+            chat_history_sel = [x.get("chat_history", []) for x in selected_data]
+            
+            final_outputs = []
+            if os.path.exists(output_filepath) and not args.overwrite:
+                 with open(output_filepath, 'r') as f: existing = json.load(f)
+                 final_outputs = [[x["output"]] if isinstance(x["output"], str) else x["output"] for x in existing]
+            
+            inputs_to_run_final = inputs_sel[len(final_outputs):]
+            
+            if inputs_to_run_final:
+                # Generate 1 (or num_outputs) full answer per selected candidate
+                gen_iter = controller.generate(inputs_to_run_final, args.num_outputs, args.max_tokens, args.temperature, args.top_p)
+                for batch_out, cur_id, batch_in in gen_iter:
+                    final_outputs.extend(batch_out)
+                    curr_ids = id_strs_sel[len(final_outputs)-len(batch_out) : len(final_outputs)]
+                    save_outputs(args, id_strs_sel, final_outputs, chat_history_sel, {"dataset": ["gsm"]*len(id_strs_sel)}, inputs_sel, output_filepath, model_name=current_model_name)
+
+            controller.unload()
+
+            # 6. Compute Final Confidence (For comparison)
+            if agent_idx == args.agent_num - 1:
+                print(f"[{agent_idx}] Computing Final Confidence for Reviser...")
+                conf_final_path = output_filepath.replace(".json", "_final_conf.json")
+                SelectionManager._run_worker(args, agent_idx, output_filepath, current_model_name, conf_final_path)
+                reviser_final_file = SelectionManager.select_best_output(args, agent_idx, conf_final_path)
+
+    # --- Final Step: Confidence Comparison ---
+    if input_selection_file and reviser_final_file:
+        run_final_confidence_comparison(args, input_selection_file, reviser_final_file)
+    else:
+        print("Comparison skipped (files missing).")
 
 if __name__ == "__main__":
-    args = parse_args()
-    args = sanitize_args(args)
-    
-    # make sure output folder exists
-    os.makedirs(args.output_folder, exist_ok=True)
-
-    llm_list = []
-    lora_requests = []  # parallel list to llm_list, store lora_request or None for each agent
-
-    # Build agent models (currently all agents use args.model_name; if you want different models per agent,
-    # adjust this section to read a list of model names)
-    print("loading model(s) for each agent!")
-
-    llm_list = []
-    lora_requests = []
-
-    # Keep args.tokenizer_name as 'auto' to allow per-agent tokenizer selection.
-
-    if args.engine == "vllm":
-        # Per-agent lazy loading: do not create all LLMs at startup to save memory.
-        from vllm import LLM
-        max_model_len = None if args.max_model_len == -1 else args.max_model_len
-
-        # build agent model name list
-        if args.agent_model_names:
-            candidate_names = [x.strip() for x in args.agent_model_names.split(",") if x.strip()]
-        else:
-            candidate_names = []
-        # pad/truncate to agent_num
-        agent_model_names = []
-        for i in range(args.agent_num):
-            if i < len(candidate_names):
-                agent_model_names.append(candidate_names[i])
-            else:
-                agent_model_names.append(args.model_name)
-
-        # We store None in llm_list initially; will load per-agent LLM when agent runs
-        for i in range(args.agent_num):
-            llm_list.append(None)
-            lora_requests.append(None)
-
-        # attach helper for lazy loading
-        def load_agent_llm(agent_idx):
-            model_name_for_agent = agent_model_names[agent_idx]
-            base_model_name_or_path, lora_model_name_or_path = infer_maybe_lora(model_name_for_agent)
-            lora_req = None
-            if lora_model_name_or_path:
-                from vllm.lora.request import LoRARequest
-                lora_req = LoRARequest(lora_model_name_or_path.split("/")[-1], 1, lora_model_name_or_path)
-            # try to instantiate LLM, with simple backoff reducing gpu_memory_utilization
-            trial_util = args.gpu_memory_utilization
-            last_exc = None
-            for attempt in range(3):
-                try:
-                    llm_instance = LLM(
-                        model=base_model_name_or_path,
-                        tokenizer=model_name_for_agent if args.tokenizer_name == "auto" else args.tokenizer_name,
-                        tensor_parallel_size=args.tensor_parallel_size,
-                        download_dir=args.download_dir,
-                        dtype=args.dtype,
-                        tokenizer_mode=args.tokenizer_mode,
-                        max_model_len=max_model_len,
-                        trust_remote_code=True,
-                        gpu_memory_utilization=trial_util,
-                        enable_lora=(lora_req is not None),
-                        max_num_seqs=128,
-                        enable_sleep_mode=True
-                    )
-                    last_exc = None
-                    break
-                except Exception as e:
-                    last_exc = e
-                    # if memory related, try to reduce requested utilization
-                    msg = str(e)
-                    if "Free memory on device" in msg or "less than desired GPU memory utilization" in msg:
-                        trial_util = max(0.2, trial_util - 0.2)
-                        continue
-                    else:
-                        break
-            if last_exc is not None:
-                raise last_exc
-            llm_list[agent_idx] = llm_instance
-            lora_requests[agent_idx] = lora_req
-            return llm_instance, lora_req
-
-        # Helper to unload an agent's llm
-        def unload_agent_llm(agent_idx):
-            inst = llm_list[agent_idx]
-            if inst is None:
-                print(f"unload_agent_llm: no instance for agent {agent_idx}, nothing to unload")
-                return
-
-            print(f"unload_agent_llm: unloading agent {agent_idx} LLM instance...")
-            try:
-                inst.sleep(level=2)
-                print(f"unload_agent_llm: called close() on agent {agent_idx} LLM")
-            except Exception as e:
-                print(f"unload_agent_llm: exception calling close() on agent {agent_idx}: {e}")
-
-            # remove references
-            llm_list[agent_idx] = None
-            lora_requests[agent_idx] = None
-
-            # best-effort GPU memory cleanup
-            try:
-                import torch
-                torch.cuda.empty_cache()
-                print("unload_agent_llm: torch.cuda.empty_cache() called")
-            except Exception:
-                print("unload_agent_llm: torch not available or cuda empty cache failed")
-            gc.collect()
-
-            # Wait for GPU memory to be freed (best-effort).
-            def _get_gpu_mem_info(gpu_index=0):
-                try:
-                    out = subprocess.check_output([
-                        "nvidia-smi",
-                        "--query-gpu=memory.total,memory.free",
-                        "--format=csv,noheader,nounits",
-                        "-i",
-                        str(gpu_index),
-                    ])
-                    line = out.decode().strip().splitlines()[0]
-                    total_kb, free_kb = [int(x) for x in line.split(",")]
-                    total_gb = total_kb / 1024.0
-                    free_gb = free_kb / 1024.0
-                    return total_gb, free_gb
-                except Exception as e:
-                    print(f"unload_agent_llm: failed to query nvidia-smi: {e}")
-                    return None, None
-
-            def _wait_for_gpu_free(required_free_gb, timeout=60, poll_interval=2, gpu_index=0):
-                start = time.time()
-                while time.time() - start < timeout:
-                    total, free = _get_gpu_mem_info(gpu_index)
-                    if free is None:
-                        # cannot query, fallback to fixed sleep
-                        print("unload_agent_llm: cannot query GPU free memory, falling back to sleep(20)")
-                        time.sleep(20)
-                        return True
-                    print(f"unload_agent_llm: waiting for free GPU >= {required_free_gb:.2f}GB; current free={free:.2f}GB")
-                    if free >= required_free_gb:
-                        return True
-                    time.sleep(poll_interval)
-                return False
-
-            total_gb, free_gb = _get_gpu_mem_info(0)
-            if total_gb is not None:
-                requested_util = float(getattr(args, "gpu_memory_utilization", 0.5))
-                required_free = max(1.0, total_gb * requested_util)
-                ok = _wait_for_gpu_free(required_free, timeout=60, poll_interval=2, gpu_index=0)
-                if not ok:
-                    print("unload_agent_llm: GPU did not free up in time, sleeping fallback 20s")
-                    time.sleep(20)
-                else:
-                    print("unload_agent_llm: GPU memory freed to required level")
-            else:
-                # couldn't query via nvidia-smi: fallback to fixed sleep
-                print("unload_agent_llm: nvidia-smi unavailable, sleeping fallback 20s")
-                time.sleep(20)
-
-    elif args.engine == "hf":
-        llm = DecoderOnlyModelManager(args.model_name, args.model_name, cache_dir=args.download_dir,
-                                    bf16=args.hf_bf16, gptq=args.hf_gptq)
-        llm.load_model()
-        for i in range(args.agent_num):
-            llm_list.append(llm)
-            lora_requests.append(None)
-    else:
-        raise ValueError(f"Unsupported engine: {args.engine}")
-    print(f"Loaded {len(llm_list)} agent models.")    
-
-    # (Per-agent stop/token logic moved into agent loop so templates and stops match each agent's model.)
-
-    # We'll store each agent's outputs here: a list where each element is the outputs list-of-lists for that agent
-    outputs_per_agent = []
-
-    # For each agent, perform generation. Agent 0 uses original dataset; agent k>0 uses outputs_per_agent[k-1]
-    for agent_idx in range(len(llm_list)):
-        print(f"\n=== Running agent {agent_idx} ===")
-        # Lazy-load per-agent LLM if using vllm
-        if args.engine == "vllm":
-            if llm_list[agent_idx] is None:
-                agent_llm, agent_lora_request = load_agent_llm(agent_idx)
-            else:
-                agent_llm = llm_list[agent_idx]
-                agent_lora_request = lora_requests[agent_idx]
-        else:
-            agent_llm = llm_list[agent_idx]
-            agent_lora_request = lora_requests[agent_idx]
-        # determine which model name this agent uses
-        if args.engine == "vllm":
-            model_name_for_agent = agent_model_names[agent_idx]
-        else:
-            model_name_for_agent = args.model_name
-
-        # pass per-agent model_name into load_eval_data so templates (map_to_conv) use correct model
-        id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=False, model_name=model_name_for_agent)
-
-        # token/stopping token logic per-agent
-        stop_words = []
-        include_stop_str_in_output = False
-        stop_token_ids = []
-        try:
-            if model_name_for_agent in IM_END_MODELS:
-                hf_tokenizer = AutoTokenizer.from_pretrained(model_name_for_agent, trust_remote_code=True)
-                potential_end_tokens = ["<|im_end|>", "<|eot_id|>"]
-                for potential_end_token in potential_end_tokens:
-                    if potential_end_token in hf_tokenizer.get_vocab():
-                        stop_token_ids += [hf_tokenizer.get_vocab()[potential_end_token]]
-            if model_name_for_agent in HF_TEMPLATED_MODELS:
-                hf_tokenizer = AutoTokenizer.from_pretrained(model_name_for_agent, trust_remote_code=True)
-                stop_token_ids.append(hf_tokenizer.eos_token_id)
-        except Exception:
-            stop_token_ids = []
-        
-        if agent_idx == 0:
-            id_strs = id_strs_orig[:]  # session ids
-            chat_history = chat_history_orig[:]
-            model_inputs = model_inputs_orig[:]  # prompts
-            metadata = {k: v[:] for k, v in metadata_orig.items()}
-        else:
-            model_inputs = model_inputs_orig[:]
-            
-            if len(model_inputs) != len(id_strs_orig):
-                min_len = min(len(model_inputs), len(id_strs_orig))
-                model_inputs = model_inputs[:min_len]
-                id_strs = id_strs_orig[:min_len]
-                chat_history = chat_history_orig[:min_len]
-                metadata = {k: v[:min_len] for k, v in metadata_orig.items()}
-            else:
-                id_strs = id_strs_orig[:]
-                chat_history = chat_history_orig[:]
-                metadata = {k: v[:] for k, v in metadata_orig.items()}
-        
-        # decide start_index and end_index by num_shards and shard_id (same logic as before)
-        if args.num_shards > 1:
-            num_data = len(id_strs)
-            shard_size = num_data // args.num_shards
-            start_index = args.shard_id * shard_size
-            end_index = (args.shard_id + 1) * shard_size
-            if args.shard_id == args.num_shards - 1:
-                end_index = num_data
-        else:
-            start_index = args.start_index
-            end_index = args.end_index
-
-        # Decide the output filepath for this agent
-        if args.filepath == "auto":
-            if end_index == -1 and start_index == 0:
-                filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_temp_output.json" if agent_idx > 0 else f"{args.output_folder}/{args.data_name}/agent0_output.json"
-            else:
-                filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}.{start_index}-{end_index}_output.json" if agent_idx > 0 else f"{args.output_folder}/{args.data_name}/agent0.{start_index}-{end_index}_output.json"
-        else:
-            # if explicit filepath given, append agent suffix to avoid overwrite
-            base, ext = os.path.splitext(args.filepath)
-            filepath = f"{base}.agent{agent_idx}{ext}"
-
-            output_folder = "/".join(filepath.split("/")[:-1])
-            if not os.path.exists(output_folder):
-                os.makedirs(output_folder, exist_ok=True)
-
-        # Clip indices and slice inputs
-        if end_index < 0 or end_index > len(model_inputs):
-            end_index = len(model_inputs)
-        model_inputs = model_inputs[start_index:end_index]
-        id_strs = id_strs[start_index:end_index]
-        chat_history = chat_history[start_index:end_index]
-        metadata = {key: metadata[key][start_index:end_index] for key in metadata}
-
-        print(f"Agent {agent_idx} will run on indices [{start_index}:{end_index}] -> {len(model_inputs)} items")
-        print(f"Agent {agent_idx} output filepath: {filepath}")
-
-        # Load existing outputs for this agent if present and not overwrite
-        outputs = []
-        if os.path.exists(filepath) and not args.overwrite:
-            with open(filepath, "r", encoding="utf-8") as f:
-                formatted_outputs = json.load(f)
-            for output_item in formatted_outputs:
-                outputs.append([output_item["output"]] if type(output_item["output"]) == str else output_item["output"])
-            num_skipped = len(outputs)
-            print(f"Agent {agent_idx}: found existing file, skipped first {num_skipped} examples")
-        else:
-            num_skipped = 0
-
-        # Load cache file if provided (same as before)
-        cache_outputs = {}
-        if args.cache_filepath is not None:
-            if os.path.exists(args.cache_filepath):
-                with open(args.cache_filepath, "r", encoding="utf-8") as f:
-                    cache_data = json.load(f)
-                for output_item in cache_data:
-                    if type(output_item.get("output")) == list and len(output_item["output"]) > 0 and len(output_item["output"][0]) > 0:
-                        cache_outputs[output_item["session_id"]] = output_item
-            print(f"Agent {agent_idx}: Loaded {len(cache_outputs)} non-empty outputs from cache: {args.cache_filepath}")
-
-        # Prepare generation loop for this agent
-        todo_inputs = model_inputs[num_skipped:]
-        if len(todo_inputs) == 0:
-            print(f"Agent {agent_idx}: no new inputs to process.")
-            # still append the existing outputs (maybe empty) to outputs_per_agent
-            outputs_per_agent.append(outputs)
-            try:
-                print(f"Agent {agent_idx}: unloading agent LLM to free GPU memory (unload_after_agent=True)")
-                unload_agent_llm(agent_idx)
-            except Exception as e:
-                print(f"Agent {agent_idx}: unload_agent_llm raised exception: {e}")
-            
-            continue
-
-        # generation
-        if args.engine == "vllm":
-            if agent_idx > 0:
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(
-                    top_p=args.top_p,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    max_tokens=64,
-                    stop=stop_words,
-                    stop_token_ids=stop_token_ids,
-                    include_stop_str_in_output=include_stop_str_in_output,
-                    n=args.sample_num
-                )
-
-                # generate in batches
-                for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating"):
-                    batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
-                    # For vllm, pass lora_request if present
-                    batch_outputs = agent_llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=agent_lora_request)
-                    # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
-                    outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
-                    # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-                # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-                print(f"Agent {agent_idx}: unloading agent LLM to free GPU memory (unload_after_agent=True)")
-                unload_agent_llm(agent_idx)
-                print(f"Agent {agent_idx}: starting confidence calculation and selection...")
-                conf_gpu_id = "0"  
-                tmp_conf_out = f"{args.output_folder}/agent{agent_idx}_conf.json"
-
-                python_exe = shlex.quote(sys.executable) if 'shlex' in globals() else sys.executable
-
-                cmd = [
-                    python_exe,
-                    "MAC/compute_conf_worker.py",
-                    conf_gpu_id,
-                    filepath,
-                    model_name_for_agent,
-                    tmp_conf_out,
-                ]
-
-                env = os.environ.copy()
-                if conf_gpu_id.strip() == "":
-                    env["CUDA_VISIBLE_DEVICES"] = ""
-                else:
-                    env["CUDA_VISIBLE_DEVICES"] = str(conf_gpu_id)
-
-                ret = subprocess.run(cmd, env=env)
-                if ret.returncode != 0:
-                    raise RuntimeError(f"compute_conf_worker failed (returncode={ret.returncode})")
-
-                with open(tmp_conf_out, "r", encoding="utf-8") as f:
-                    confidence_dict = json.load(f)
-                # ----- END: separate-process confidence calc -----
-
-                ind_list = []
-                group_best_val = -1.0     
-                group_best_idx = None
-
-                for i, rec in enumerate(confidence_dict):
-                    confs = rec["confidence_list"]
-                    avg = sum(confs) / len(confs) if len(confs) > 0 else 0.0
-
-                    if avg > group_best_val:
-                        group_best_val = avg
-                        group_best_idx = i
-
-                    if i % args.num_outputs == args.num_outputs - 1:
-                        ind_list.append(group_best_idx)
-                        group_best_val = -1.0
-                        group_best_idx = None
-                selected_items = []
-                for idx in ind_list:
-                    if idx is None:
-                        continue
-                    if 0 <= idx < len(confidence_dict):
-                        selected_items.append(confidence_dict[idx])
-
-                selected_output_file = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_conf_selected.json"
-
-                os.makedirs(os.path.dirname(selected_output_file) or ".", exist_ok=True)
-
-                with open(selected_output_file, "w", encoding="utf-8") as f:
-                    json.dump(selected_items, f, ensure_ascii=False, indent=2)
-
-                print(f"\n=== Agent {agent_idx} starts to generate completely ===")
-                if args.engine == "vllm":
-                    if llm_list[agent_idx] is None:
-                        agent_llm, agent_lora_request = load_agent_llm(agent_idx)
-                    else:
-                        agent_llm = llm_list[agent_idx]
-                        agent_lora_request = lora_requests[agent_idx]
-                else:
-                    agent_llm = llm_list[agent_idx]
-                    agent_lora_request = lora_requests[agent_idx]
-                
-                id_strs_orig, chat_history_orig, model_inputs_orig, metadata_orig = load_eval_data(args, agent_idx, selected=True, model_name=model_name_for_agent)
-                
-                model_inputs = model_inputs_orig[:]
-                
-                if len(model_inputs) != len(id_strs_orig):
-                    min_len = min(len(model_inputs), len(id_strs_orig))
-                    model_inputs = model_inputs[:min_len]
-                    id_strs = id_strs_orig[:min_len]
-                    chat_history = chat_history_orig[:min_len]
-                    metadata = {k: v[:min_len] for k, v in metadata_orig.items()}
-                else:
-                    id_strs = id_strs_orig[:]
-                    chat_history = chat_history_orig[:]
-                    metadata = {k: v[:] for k, v in metadata_orig.items()}
-                
-                # decide start_index and end_index by num_shards and shard_id (same logic as before)
-                if args.num_shards > 1:
-                    num_data = len(id_strs)
-                    shard_size = num_data // args.num_shards
-                    start_index = args.shard_id * shard_size
-                    end_index = (args.shard_id + 1) * shard_size
-                    if args.shard_id == args.num_shards - 1:
-                        end_index = num_data
-                else:
-                    start_index = args.start_index
-                    end_index = args.end_index
-
-                # Decide the output filepath for this agent
-                if args.filepath == "auto":
-                    # file per agent
-                    if end_index == -1 and start_index == 0:
-                        filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}_output.json"
-                    else:
-                        filepath = f"{args.output_folder}/{args.data_name}/agent{agent_idx}.{start_index}-{end_index}_output.json"
-
-                else:
-                    # if explicit filepath given, append agent suffix to avoid overwrite
-                    base, ext = os.path.splitext(args.filepath)
-                    filepath = f"{base}.agent{agent_idx}{ext}"
-
-                    output_folder = "/".join(filepath.split("/")[:-1])
-                    if not os.path.exists(output_folder):
-                        os.makedirs(output_folder, exist_ok=True)
-
-                # Clip indices and slice inputs
-                if end_index < 0 or end_index > len(model_inputs):
-                    end_index = len(model_inputs)
-                model_inputs = model_inputs[start_index:end_index]
-                id_strs = id_strs[start_index:end_index]
-                chat_history = chat_history[start_index:end_index]
-                metadata = {key: metadata[key][start_index:end_index] for key in metadata}
-
-                print(f"Agent {agent_idx} will run on indices [{start_index}:{end_index}] -> {len(model_inputs)} items")
-                print(f"Agent {agent_idx} output filepath: {filepath}")
-
-                # Load existing outputs for this agent if present and not overwrite
-                outputs = []
-                if os.path.exists(filepath) and not args.overwrite:
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        formatted_outputs = json.load(f)
-                    for output_item in formatted_outputs:
-                        outputs.append([output_item["output"]] if type(output_item["output"]) == str else output_item["output"])
-                    num_skipped = len(outputs)
-                    print(f"Agent {agent_idx}: found existing file, skipped first {num_skipped} examples")
-                else:
-                    num_skipped = 0
-
-                # Load cache file if provided (same as before)
-                cache_outputs = {}
-                if args.cache_filepath is not None:
-                    if os.path.exists(args.cache_filepath):
-                        with open(args.cache_filepath, "r", encoding="utf-8") as f:
-                            cache_data = json.load(f)
-                        for output_item in cache_data:
-                            if type(output_item.get("output")) == list and len(output_item["output"]) > 0 and len(output_item["output"][0]) > 0:
-                                cache_outputs[output_item["session_id"]] = output_item
-                    print(f"Agent {agent_idx}: Loaded {len(cache_outputs)} non-empty outputs from cache: {args.cache_filepath}")
-
-                # Prepare generation loop for this agent
-                todo_inputs = model_inputs[num_skipped:]
-                if len(todo_inputs) == 0:
-                    print(f"Agent {agent_idx}: no new inputs to process.")
-                    # still append the existing outputs (maybe empty) to outputs_per_agent
-                    outputs_per_agent.append(outputs)
-                    continue
-
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(
-                    top_p=args.top_p,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    max_tokens=args.max_tokens,
-                    stop=stop_words,
-                    stop_token_ids=stop_token_ids,
-                    include_stop_str_in_output=include_stop_str_in_output,
-                    n=args.num_outputs
-                )
-
-                # generate in batches
-                for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating"):
-                    batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
-                    # For vllm, pass lora_request if present
-                    batch_outputs = agent_llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=agent_lora_request)
-                    # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
-                    outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
-                    # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-                # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-            else:
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(
-                    top_p=args.top_p,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    max_tokens=args.max_tokens,
-                    stop=stop_words,
-                    stop_token_ids=stop_token_ids,
-                    include_stop_str_in_output=include_stop_str_in_output,
-                    n=args.num_outputs
-                )
-
-                # generate in batches
-                for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating"):
-                    batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
-                    # For vllm, pass lora_request if present
-                    batch_outputs = agent_llm.generate(batch_inputs, sampling_params, use_tqdm=False, lora_request=agent_lora_request)
-                    # each x in batch_outputs corresponds to an input; extract x.outputs -> list of generated objects; use .text
-                    outputs.extend([[o.text for o in x.outputs] for x in batch_outputs])
-                    # save incremental results for safety
-                    save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-                # final save
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-            
-
-        elif args.engine == "hf":
-            # A generic HF generation wrapper — adapt if your DecoderOnlyModelManager API differs.
-            # We assume llm.generate returns a list matching batch_inputs, where each item is a list of generated strings.
-            for cur_id in tqdm(range(0, len(todo_inputs), args.batch_size), desc=f"Agent {agent_idx} generating (hf)"):
-                batch_inputs = todo_inputs[cur_id:cur_id+args.batch_size]
-                gen_args = {
-                    "num_outputs": args.num_outputs,
-                    "max_output_tokens": args.max_tokens,
-                    "temperature": args.temperature,
-                    "top_p": args.top_p,    
-                }
-
-                batch_outputs = agent_llm.infer_generate(batch_inputs, args=gen_args)
-                outputs.extend(batch_outputs)
-                
-                save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-            save_outputs(args, id_strs, outputs, chat_history, metadata, model_inputs, filepath, model_name=model_name_for_agent)
-
-        else:
-            raise ValueError(f"Unsupported engine: {args.engine}")
-
-
-        print(f"Agent {agent_idx} finished. Generated {len(outputs)} items.")
-
-        # Optionally unload vllm model instance for this agent to free GPU memory
-        if args.engine == "vllm":
-        
-            try:
-                print(f"Agent {agent_idx}: unloading agent LLM to free GPU memory (unload_after_agent=True)")
-                unload_agent_llm(agent_idx)
-            except Exception as e:
-                print(f"Agent {agent_idx}: unload_agent_llm raised exception: {e}")
-            
-
-    print("\nAll agents finished. Outputs saved per agent in:", args.output_folder)
-    conf_gpu_id = "0"  
-    tmp_conf_out = f"{args.output_folder}/{args.data_name}/final_conf.json"
-
-    python_exe = shlex.quote(sys.executable) if 'shlex' in globals() else sys.executable
-
-    cmd = [
-        python_exe,
-        "MAC/compute_conf_worker.py",
-        conf_gpu_id,
-        f"{args.output_folder}/agent{args.agent_num-1}_output.json",
-        model_name_for_agent,
-        tmp_conf_out,
-    ]
-
-    env = os.environ.copy()
-    if conf_gpu_id.strip() == "":
-        env["CUDA_VISIBLE_DEVICES"] = ""
-    else:
-        env["CUDA_VISIBLE_DEVICES"] = str(conf_gpu_id)
-
-    ret = subprocess.run(cmd, env=env)
-    if ret.returncode != 0:
-        raise RuntimeError(f"compute_conf_worker failed (returncode={ret.returncode})")
-
-    with open(tmp_conf_out, "r", encoding="utf-8") as f:
-        confidence_dict = json.load(f)
-    # ----- END: separate-process confidence calc -----
-
-    # For each record in confidence_dict, keep only the output whose confidence equals the max
-    selected_items = []
-    for rec in confidence_dict:
-        # expected rec to contain at least 'confidence_list' and 'output'
-        confs = rec.get("confidence_list") 
-        outs = rec.get("output")
-
-            # pick index of max confidence (first occurrence if multiple)
-        max_idx = int(max(range(len(confs)), key=lambda j: confs[j]))
-        sel_out = outs[max_idx]
-        sel_conf = confs[max_idx]
-        # preserve session id if present
-        sess = rec.get("session_id") 
-        input = rec.get("model_input") 
-        question = rec.get("question") 
-        answer = rec.get("answer") 
-        generator = rec.get("generator")
-        dataset = rec.get("dataset")
-        selected_items.append({"session_id": sess, "model_inputs":input,"output": [sel_out], "generator":generator,"dataset":dataset,"question":question,"answer":answer,"confidence": [sel_conf]})
-    print(1)
-    # write final answers
-    selected_output_file = f"{args.output_folder}/{args.data_name}/MA_final_answer.json"
-    os.makedirs(os.path.dirname(selected_output_file) or ".", exist_ok=True)
-    with open(selected_output_file, "w", encoding="utf-8") as f:
-        json.dump(selected_items, f, ensure_ascii=False, indent=2)
-    
-
-
+    main()
 
